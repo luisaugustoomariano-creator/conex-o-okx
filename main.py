@@ -23,13 +23,16 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 # ⚙️ CONFIG
 # ================================
-PAIR = "BTC-USDT"
-ORDER_SIZE_USDT = 12
+PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+
+# 🔥 AUMENTADO + MARGEM
+ORDER_SIZE_USDT = 15
+
 TAKE_PROFIT = 0.7
 STOP_LOSS = -0.3
 DRY_RUN = False
 
-MIN_BTC_SIZE = 0.0001  # 🔥 mínimo OKX
+MIN_SIZE = 0.0001
 
 # ================================
 # 🧠 ESTADO
@@ -77,7 +80,7 @@ def log_trade(pair, action, price, pnl, reason):
     conn.close()
 
 # ================================
-# 🔐 AUTH OKX
+# 🔐 OKX AUTH
 # ================================
 def sign(message, secret):
     return base64.b64encode(
@@ -86,7 +89,6 @@ def sign(message, secret):
 
 def get_headers(method, endpoint, body=""):
     timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-
     message = timestamp + method + endpoint + body
     signature = sign(message, OKX_SECRET_KEY)
 
@@ -99,24 +101,27 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 SIZE CORRETO
+# 📊 SIZE INTELIGENTE (CORRIGIDO)
 # ================================
 def calculate_size(price):
-    size = ORDER_SIZE_USDT / price
 
-    # garante mínimo
-    if size < MIN_BTC_SIZE:
-        size = MIN_BTC_SIZE
+    # 🔥 margem de segurança 10%
+    safe_usdt = ORDER_SIZE_USDT * 1.1
 
-    # força formato correto (sem notação científica)
+    size = safe_usdt / price
+
+    if size < MIN_SIZE:
+        size = MIN_SIZE
+
     return "{:.6f}".format(size)
 
 # ================================
 # 💰 EXECUÇÃO
 # ================================
-def place_order(side, price):
+def place_order(side, price, pair):
+
     if DRY_RUN:
-        print(f"🧪 DRY RUN: {side} @ {price}")
+        print(f"🧪 DRY RUN: {side} {pair} @ {price}")
         return {"code": "0"}
 
     endpoint = "/api/v5/trade/order"
@@ -125,7 +130,7 @@ def place_order(side, price):
     size = calculate_size(price)
 
     body = {
-        "instId": PAIR,
+        "instId": pair,
         "tdMode": "cash",
         "side": side.lower(),
         "ordType": "market",
@@ -161,77 +166,101 @@ def get_candles(pair):
     return closes, volumes
 
 # ================================
-# 🧠 SCALPING
+# 🧠 GERENCIAMENTO
+# ================================
+def manage_position():
+
+    global position
+
+    data = get_candles(position["pair"])
+    if not data:
+        return {"action": "NO_DATA"}
+
+    closes, _ = data
+    current_price = closes[0]
+
+    entry = position["entry_price"]
+    pnl = ((current_price - entry) / entry) * 100
+
+    if pnl >= TAKE_PROFIT:
+        order = place_order("sell", current_price, position["pair"])
+
+        if order.get("code") == "0":
+            log_trade(position["pair"], "SELL", current_price, pnl, "tp")
+            position["open"] = False
+            return {"action": "SELL", "pnl": pnl}
+
+    if pnl <= STOP_LOSS:
+        order = place_order("sell", current_price, position["pair"])
+
+        if order.get("code") == "0":
+            log_trade(position["pair"], "SELL", current_price, pnl, "sl")
+            position["open"] = False
+            return {"action": "SELL", "pnl": pnl}
+
+    return {"action": "HOLD", "pnl": pnl}
+
+# ================================
+# 🧠 SCANNER
 # ================================
 def scalp():
 
     global position
 
-    data = get_candles(PAIR)
+    if position["open"]:
+        return manage_position()
 
-    if not data:
-        return {"action": "NO_DATA"}
+    best_trade = None
+    best_score = 0
 
-    closes, volumes = data
-    current_price = closes[0]
+    for pair in PAIRS:
+        data = get_candles(pair)
+        if not data:
+            continue
 
-    uptrend = closes[2] < closes[1] < closes[0]
-    downtrend = closes[2] > closes[1] > closes[0]
-    volume_up = volumes[2] < volumes[1] < volumes[0]
+        closes, volumes = data
 
-    # ============================
-    # 🟢 ENTRY
-    # ============================
-    if not position["open"]:
-        if uptrend and volume_up:
+        score = 0
 
-            order = place_order("buy", current_price)
+        if closes[1] < closes[0]:
+            score += 1
 
-            if order.get("code") == "0":
-                position["open"] = True
-                position["entry_price"] = current_price
-                position["pair"] = PAIR
+        if closes[2] < closes[1] < closes[0]:
+            score += 2
 
-                log_trade(PAIR, "BUY", current_price, 0, "entry")
+        if volumes[1] < volumes[0]:
+            score += 1
 
-                return {"action": "BUY", "price": current_price}
+        if volumes[2] < volumes[1] < volumes[0]:
+            score += 2
 
-        return {"action": "HOLD"}
+        print(f"📊 {pair} score={score}")
 
-    # ============================
-    # 🔴 EXIT
-    # ============================
-    entry = position["entry_price"]
-    pnl = ((current_price - entry) / entry) * 100
+        if score >= 3 and score > best_score:
+            best_score = score
+            best_trade = {
+                "pair": pair,
+                "price": closes[0],
+                "score": score
+            }
 
-    if pnl >= TAKE_PROFIT:
-        order = place_order("sell", current_price)
-
-        if order.get("code") == "0":
-            position["open"] = False
-            log_trade(PAIR, "SELL", current_price, pnl, "take profit")
-
-            return {"action": "SELL", "pnl": round(pnl, 3)}
-
-    if pnl <= STOP_LOSS:
-        order = place_order("sell", current_price)
+    if best_trade:
+        order = place_order("buy", best_trade["price"], best_trade["pair"])
 
         if order.get("code") == "0":
-            position["open"] = False
-            log_trade(PAIR, "SELL", current_price, pnl, "stop loss")
+            position["open"] = True
+            position["entry_price"] = best_trade["price"]
+            position["pair"] = best_trade["pair"]
 
-            return {"action": "SELL", "pnl": round(pnl, 3)}
+            log_trade(best_trade["pair"], "BUY", best_trade["price"], 0, f"score={best_trade['score']}")
 
-    if downtrend:
-        order = place_order("sell", current_price)
+            return {
+                "action": "BUY",
+                "pair": best_trade["pair"],
+                "score": best_trade["score"]
+            }
 
-        if order.get("code") == "0":
-            position["open"] = False
-            log_trade(PAIR, "SELL", current_price, pnl, "reversal")
-
-            return {"action": "SELL", "pnl": round(pnl, 3)}
-
-    return {"action": "HOLD", "pnl": round(pnl, 3)}
+    return {"action": "HOLD"}
 
 # ================================
 # 🔁 LOOP
