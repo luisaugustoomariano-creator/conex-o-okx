@@ -6,6 +6,7 @@ import hmac
 import base64
 import threading
 import sqlite3
+import json
 
 app = FastAPI()
 
@@ -20,14 +21,16 @@ OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
 # ================================
-# ⚙️ CONFIG SCALPING
+# ⚙️ CONFIG SCALPING (AJUSTADO)
 # ================================
 PAIR = "BTC-USDT"
-TAKE_PROFIT = 0.5   # %
-STOP_LOSS = -0.5    # %
+ORDER_SIZE_USDT = 5
+TAKE_PROFIT = 0.3
+STOP_LOSS = -0.3
+DRY_RUN = False  # 🔥 TRUE pra simular
 
 # ================================
-# 🧠 ESTADO (memória)
+# 🧠 ESTADO
 # ================================
 position = {
     "open": False,
@@ -72,14 +75,7 @@ def log_trade(pair, action, price, pnl, reason):
     conn.close()
 
 # ================================
-# 🔐 AUTH
-# ================================
-def validate_token(auth):
-    if auth != f"Bearer {API_TOKEN}":
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-# ================================
-# 🔐 OKX SIGNATURE
+# 🔐 OKX AUTH
 # ================================
 def sign(message, secret):
     return base64.b64encode(
@@ -100,22 +96,44 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 🟢 HEALTH
+# 📊 SIZE CORRETO
 # ================================
-@app.get("/")
-def home():
-    return {"status": "running"}
+def calculate_size(price):
+    return round(ORDER_SIZE_USDT / price, 6)
+
+# ================================
+# 💰 EXECUÇÃO REAL
+# ================================
+def place_order(side, price):
+    if DRY_RUN:
+        print(f"🧪 DRY RUN: {side} @ {price}")
+        return {"status": "simulated"}
+
+    endpoint = "/api/v5/trade/order"
+    url = OKX_BASE + endpoint
+
+    size = calculate_size(price)
+
+    body = {
+        "instId": PAIR,
+        "tdMode": "cash",
+        "side": side.lower(),
+        "ordType": "market",
+        "sz": str(size)
+    }
+
+    body_str = json.dumps(body)
+    headers = get_headers("POST", endpoint, body_str)
+
+    response = requests.post(url, headers=headers, data=body_str)
+
+    print("📡 ORDER:", body)
+    print("📡 RESPONSE:", response.json())
+
+    return response.json()
 
 # ================================
 # 📊 MARKET
-# ================================
-@app.get("/market")
-def get_market(instId: str):
-    url = f"{OKX_BASE}/api/v5/market/ticker?instId={instId}"
-    return requests.get(url).json()
-
-# ================================
-# 📊 CANDLES
 # ================================
 def get_candles(pair):
     url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar=1m&limit=5"
@@ -134,7 +152,6 @@ def get_candles(pair):
 # ================================
 # 🧠 SCALPING
 # ================================
-@app.get("/scalp")
 def scalp():
 
     global position
@@ -156,17 +173,16 @@ def scalp():
     # ============================
     if not position["open"]:
         if uptrend and volume_up:
+
+            place_order("buy", current_price)
+
             position["open"] = True
             position["entry_price"] = current_price
             position["pair"] = PAIR
 
             log_trade(PAIR, "BUY", current_price, 0, "entry")
 
-            return {
-                "action": "BUY",
-                "price": current_price,
-                "reason": "micro uptrend + volume"
-            }
+            return {"action": "BUY", "price": current_price}
 
         return {"action": "HOLD"}
 
@@ -177,86 +193,30 @@ def scalp():
     pnl = ((current_price - entry) / entry) * 100
 
     if pnl >= TAKE_PROFIT:
-        position["open"] = False
+        place_order("sell", current_price)
 
+        position["open"] = False
         log_trade(PAIR, "SELL", current_price, pnl, "take profit")
 
-        return {
-            "action": "SELL",
-            "price": current_price,
-            "pnl": round(pnl, 3),
-            "reason": "take profit"
-        }
+        return {"action": "SELL", "pnl": round(pnl, 3)}
 
     if pnl <= STOP_LOSS:
-        position["open"] = False
+        place_order("sell", current_price)
 
+        position["open"] = False
         log_trade(PAIR, "SELL", current_price, pnl, "stop loss")
 
-        return {
-            "action": "SELL",
-            "price": current_price,
-            "pnl": round(pnl, 3),
-            "reason": "stop loss"
-        }
+        return {"action": "SELL", "pnl": round(pnl, 3)}
 
     if downtrend:
+        place_order("sell", current_price)
+
         position["open"] = False
+        log_trade(PAIR, "SELL", current_price, pnl, "reversal")
 
-        log_trade(PAIR, "SELL", current_price, pnl, "trend reversal")
+        return {"action": "SELL", "pnl": round(pnl, 3)}
 
-        return {
-            "action": "SELL",
-            "price": current_price,
-            "pnl": round(pnl, 3),
-            "reason": "trend reversal"
-        }
-
-    return {
-        "action": "HOLD",
-        "pnl": round(pnl, 3)
-    }
-
-# ================================
-# 📊 HISTÓRICO
-# ================================
-@app.get("/trades")
-def get_trades():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50")
-    rows = cursor.fetchall()
-
-    conn.close()
-
-    return [
-        {
-            "id": r[0],
-            "pair": r[1],
-            "action": r[2],
-            "price": r[3],
-            "pnl": r[4],
-            "reason": r[5],
-            "created_at": r[6]
-        }
-        for r in rows
-    ]
-
-# ================================
-# 📈 PNL TOTAL
-# ================================
-@app.get("/pnl")
-def get_pnl():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT SUM(pnl) FROM trades WHERE action = 'SELL'")
-    total = cursor.fetchone()[0]
-
-    conn.close()
-
-    return {"total_pnl": round(total or 0, 4)}
+    return {"action": "HOLD", "pnl": round(pnl, 3)}
 
 # ================================
 # 🔁 LOOP
