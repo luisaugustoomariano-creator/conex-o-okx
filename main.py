@@ -144,7 +144,7 @@ def place_order(side, price, pair):
     endpoint = "/api/v5/trade/order"
     url = OKX_BASE + endpoint
 
-    size = calculate_size(price)
+    size = calculate_size(price, pair)
 
     body = {
         "instId": pair,
