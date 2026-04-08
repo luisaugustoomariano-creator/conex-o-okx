@@ -25,22 +25,23 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
-ORDER_SIZE_USDT = 12  # 💰 FIXO PRA TODAS
+ORDER_SIZE_USDT = 12
 
-TAKE_PROFIT = 0.7
-STOP_LOSS = -0.3
+TAKE_PROFIT = 0.25
+STOP_LOSS = -0.25
+
 DRY_RUN = False
-
 MIN_SIZE = 0.0001
 
 # ================================
-# 🧠 ESTADO
+# 🧠 MULTI POSIÇÕES
 # ================================
-position = {
-    "open": False,
-    "entry_price": 0,
-    "pair": None
-}
+positions = {}  
+# exemplo:
+# {
+#   "BTC-USDT": {"entry_price": 65000},
+#   "ETH-USDT": {"entry_price": 3000}
+# }
 
 # ================================
 # 🗄️ DATABASE
@@ -100,18 +101,16 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 CALCULAR QUANTIDADE (SELL)
+# 📊 SIZE
 # ================================
 def calculate_size(price):
     size = ORDER_SIZE_USDT / price
-
     if size < MIN_SIZE:
         size = MIN_SIZE
-
     return "{:.6f}".format(size)
 
 # ================================
-# 💰 EXECUÇÃO CORRIGIDA
+# 💰 ORDER
 # ================================
 def place_order(side, price, pair):
 
@@ -122,23 +121,17 @@ def place_order(side, price, pair):
     endpoint = "/api/v5/trade/order"
     url = OKX_BASE + endpoint
 
-    # 🔥 BUY = USDT
     if side.lower() == "buy":
-
         body = {
             "instId": pair,
             "tdMode": "cash",
             "side": "buy",
             "ordType": "market",
-            "sz": str(ORDER_SIZE_USDT),  # 💰 USDT
+            "sz": str(ORDER_SIZE_USDT),
             "tgtCcy": "quote_ccy"
         }
-
-    # 🔥 SELL = quantidade
     else:
-
         size = calculate_size(price)
-
         body = {
             "instId": pair,
             "tdMode": "cash",
@@ -169,61 +162,63 @@ def get_candles(pair):
         return None
 
     candles = res["data"]
-
     closes = [float(c[4]) for c in candles[:3]]
     volumes = [float(c[5]) for c in candles[:3]]
 
     return closes, volumes
 
 # ================================
-# 🧠 GERENCIAMENTO
+# 🧠 GERENCIAR TODAS POSIÇÕES
 # ================================
-def manage_position():
+def manage_positions():
 
-    global position
+    global positions
 
-    data = get_candles(position["pair"])
-    if not data:
-        return {"action": "NO_DATA"}
+    for pair in list(positions.keys()):
 
-    closes, _ = data
-    current_price = closes[0]
+        data = get_candles(pair)
+        if not data:
+            continue
 
-    entry = position["entry_price"]
-    pnl = ((current_price - entry) / entry) * 100
+        closes, _ = data
+        current_price = closes[0]
 
-    if pnl >= TAKE_PROFIT:
-        order = place_order("sell", current_price, position["pair"])
+        entry = positions[pair]["entry_price"]
+        pnl = ((current_price - entry) / entry) * 100
 
-        if order.get("code") == "0":
-            log_trade(position["pair"], "SELL", current_price, pnl, "tp")
-            position["open"] = False
-            return {"action": "SELL", "pnl": pnl}
+        print(f"📈 {pair} pnl={pnl:.4f}")
 
-    if pnl <= STOP_LOSS:
-        order = place_order("sell", current_price, position["pair"])
+        # TAKE PROFIT
+        if pnl >= TAKE_PROFIT:
+            order = place_order("sell", current_price, pair)
 
-        if order.get("code") == "0":
-            log_trade(position["pair"], "SELL", current_price, pnl, "sl")
-            position["open"] = False
-            return {"action": "SELL", "pnl": pnl}
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, pnl, "tp")
+                del positions[pair]
+                print(f"💰 TP SELL {pair}")
 
-    return {"action": "HOLD", "pnl": pnl}
+        # STOP LOSS
+        elif pnl <= STOP_LOSS:
+            order = place_order("sell", current_price, pair)
+
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, pnl, "sl")
+                del positions[pair]
+                print(f"🛑 SL SELL {pair}")
 
 # ================================
-# 🧠 SCANNER
+# 🧠 SCANNER + ENTRY
 # ================================
-def scalp():
+def scan_market():
 
-    global position
-
-    if position["open"]:
-        return manage_position()
-
-    best_trade = None
-    best_score = 0
+    global positions
 
     for pair in PAIRS:
+
+        # já está comprado? pula
+        if pair in positions:
+            continue
+
         data = get_candles(pair)
         if not data:
             continue
@@ -246,31 +241,19 @@ def scalp():
 
         print(f"📊 {pair} score={score}")
 
-        if score >= 3 and score > best_score:
-            best_score = score
-            best_trade = {
-                "pair": pair,
-                "price": closes[0],
-                "score": score
-            }
+        if score >= 3:
+            price = closes[0]
 
-    if best_trade:
-        order = place_order("buy", best_trade["price"], best_trade["pair"])
+            order = place_order("buy", price, pair)
 
-        if order.get("code") == "0":
-            position["open"] = True
-            position["entry_price"] = best_trade["price"]
-            position["pair"] = best_trade["pair"]
+            if order.get("code") == "0":
+                positions[pair] = {
+                    "entry_price": price
+                }
 
-            log_trade(best_trade["pair"], "BUY", best_trade["price"], 0, f"score={best_trade['score']}")
+                log_trade(pair, "BUY", price, 0, f"score={score}")
 
-            return {
-                "action": "BUY",
-                "pair": best_trade["pair"],
-                "score": best_trade["score"]
-            }
-
-    return {"action": "HOLD"}
+                print(f"🚀 BUY {pair}")
 
 # ================================
 # 🔁 LOOP
@@ -278,8 +261,8 @@ def scalp():
 def trading_loop():
     while True:
         try:
-            result = scalp()
-            print("🤖 BOT:", result)
+            manage_positions()  # 🔥 gerencia TODAS
+            scan_market()       # 🔥 continua comprando
 
         except Exception as e:
             print("❌ ERRO:", str(e))
@@ -294,7 +277,4 @@ def start_bot():
     init_db()
 
     thread = threading.Thread(target=trading_loop)
-    thread.daemon = True
     thread.start()
-
-    print("🚀 BOT INICIADO")
