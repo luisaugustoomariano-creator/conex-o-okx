@@ -5,6 +5,7 @@ import time
 import hmac
 import base64
 import threading
+import sqlite3
 
 app = FastAPI()
 
@@ -26,13 +27,49 @@ TAKE_PROFIT = 0.5   # %
 STOP_LOSS = -0.5    # %
 
 # ================================
-# 🧠 ESTADO (simples - memória)
+# 🧠 ESTADO (memória)
 # ================================
 position = {
     "open": False,
     "entry_price": 0,
     "pair": None
 }
+
+# ================================
+# 🗄️ DATABASE
+# ================================
+DB_FILE = "trades.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair TEXT,
+            action TEXT,
+            price REAL,
+            pnl REAL,
+            reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+def log_trade(pair, action, price, pnl, reason):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO trades (pair, action, price, pnl, reason)
+        VALUES (?, ?, ?, ?, ?)
+    """, (pair, action, price, pnl, reason))
+
+    conn.commit()
+    conn.close()
 
 # ================================
 # 🔐 AUTH
@@ -78,7 +115,7 @@ def get_market(instId: str):
     return requests.get(url).json()
 
 # ================================
-# 📊 CANDLES 1M
+# 📊 CANDLES
 # ================================
 def get_candles(pair):
     url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar=1m&limit=5"
@@ -95,7 +132,7 @@ def get_candles(pair):
     return closes, volumes
 
 # ================================
-# 🧠 SCALPING ENGINE
+# 🧠 SCALPING
 # ================================
 @app.get("/scalp")
 def scalp():
@@ -108,26 +145,22 @@ def scalp():
         return {"action": "NO_DATA"}
 
     closes, volumes = data
-
     current_price = closes[0]
 
-    # 📈 tendência curta
     uptrend = closes[2] < closes[1] < closes[0]
-
-    # 📉 tendência reversa
     downtrend = closes[2] > closes[1] > closes[0]
-
-    # 💧 volume crescente
     volume_up = volumes[2] < volumes[1] < volumes[0]
 
     # ============================
-    # 🟢 ENTRADA
+    # 🟢 ENTRY
     # ============================
     if not position["open"]:
         if uptrend and volume_up:
             position["open"] = True
             position["entry_price"] = current_price
             position["pair"] = PAIR
+
+            log_trade(PAIR, "BUY", current_price, 0, "entry")
 
             return {
                 "action": "BUY",
@@ -138,15 +171,15 @@ def scalp():
         return {"action": "HOLD"}
 
     # ============================
-    # 🔴 SAÍDA (GESTÃO)
+    # 🔴 EXIT
     # ============================
     entry = position["entry_price"]
-
     pnl = ((current_price - entry) / entry) * 100
 
-    # TAKE PROFIT
     if pnl >= TAKE_PROFIT:
         position["open"] = False
+
+        log_trade(PAIR, "SELL", current_price, pnl, "take profit")
 
         return {
             "action": "SELL",
@@ -155,9 +188,10 @@ def scalp():
             "reason": "take profit"
         }
 
-    # STOP LOSS
     if pnl <= STOP_LOSS:
         position["open"] = False
+
+        log_trade(PAIR, "SELL", current_price, pnl, "stop loss")
 
         return {
             "action": "SELL",
@@ -166,9 +200,10 @@ def scalp():
             "reason": "stop loss"
         }
 
-    # REVERSÃO
     if downtrend:
         position["open"] = False
+
+        log_trade(PAIR, "SELL", current_price, pnl, "trend reversal")
 
         return {
             "action": "SELL",
@@ -183,7 +218,48 @@ def scalp():
     }
 
 # ================================
-# 🔁 LOOP AUTOMÁTICO
+# 📊 HISTÓRICO
+# ================================
+@app.get("/trades")
+def get_trades():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 50")
+    rows = cursor.fetchall()
+
+    conn.close()
+
+    return [
+        {
+            "id": r[0],
+            "pair": r[1],
+            "action": r[2],
+            "price": r[3],
+            "pnl": r[4],
+            "reason": r[5],
+            "created_at": r[6]
+        }
+        for r in rows
+    ]
+
+# ================================
+# 📈 PNL TOTAL
+# ================================
+@app.get("/pnl")
+def get_pnl():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT SUM(pnl) FROM trades WHERE action = 'SELL'")
+    total = cursor.fetchone()[0]
+
+    conn.close()
+
+    return {"total_pnl": round(total or 0, 4)}
+
+# ================================
+# 🔁 LOOP
 # ================================
 def trading_loop():
     while True:
@@ -192,15 +268,17 @@ def trading_loop():
             print("🤖 BOT:", result)
 
         except Exception as e:
-            print("❌ ERRO NO LOOP:", str(e))
+            print("❌ ERRO:", str(e))
 
-        time.sleep(15)  # executa a cada 15 segundos
+        time.sleep(15)
 
 # ================================
-# 🚀 START AUTOMÁTICO
+# 🚀 START
 # ================================
 @app.on_event("startup")
 def start_bot():
+    init_db()
+
     thread = threading.Thread(target=trading_loop)
     thread.daemon = True
     thread.start()
