@@ -47,8 +47,9 @@ def home():
 
 
 @app.get("/market")
-def get_market(instId: str, authorization: str = Header(None)):
-    validate_token(authorization)
+def get_market(instId: str):
+    url = f"{OKX_BASE}/api/v5/market/ticker?instId={instId}"
+    return requests.get(url).json()
 
     url = f"{OKX_BASE}/api/v5/market/ticker?instId={instId}"
     return requests.get(url).json()
