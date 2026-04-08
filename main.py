@@ -24,9 +24,9 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ⚙️ CONFIG
 # ================================
 PAIR = "BTC-USDT"
-ORDER_SIZE_USDT = 5
+ORDER_SIZE_USDT = 12
 TAKE_PROFIT = 0.7
-STOP_LOSS = -0.4
+STOP_LOSS = -0.3
 DRY_RUN = False
 
 MIN_BTC_SIZE = 0.0001  # 🔥 mínimo OKX
