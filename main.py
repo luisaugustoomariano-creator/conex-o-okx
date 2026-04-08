@@ -7,6 +7,7 @@ import base64
 import threading
 import sqlite3
 import json
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -21,13 +22,13 @@ OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
 # ================================
-# ⚙️ CONFIG SCALPING (AJUSTADO)
+# ⚙️ CONFIG SCALPING
 # ================================
 PAIR = "BTC-USDT"
 ORDER_SIZE_USDT = 5
 TAKE_PROFIT = 0.7
 STOP_LOSS = -0.4
-DRY_RUN = False  # 🔥 TRUE pra simular
+DRY_RUN = False
 
 # ================================
 # 🧠 ESTADO
@@ -83,7 +84,8 @@ def sign(message, secret):
     ).decode()
 
 def get_headers(method, endpoint, body=""):
-    timestamp = str(time.time())
+    timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
     message = timestamp + method + endpoint + body
     signature = sign(message, OKX_SECRET_KEY)
 
@@ -96,18 +98,18 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 SIZE CORRETO
+# 📊 SIZE
 # ================================
 def calculate_size(price):
     return round(ORDER_SIZE_USDT / price, 6)
 
 # ================================
-# 💰 EXECUÇÃO REAL
+# 💰 EXECUÇÃO
 # ================================
 def place_order(side, price):
     if DRY_RUN:
         print(f"🧪 DRY RUN: {side} @ {price}")
-        return {"status": "simulated"}
+        return {"code": "0"}
 
     endpoint = "/api/v5/trade/order"
     url = OKX_BASE + endpoint
@@ -126,11 +128,12 @@ def place_order(side, price):
     headers = get_headers("POST", endpoint, body_str)
 
     response = requests.post(url, headers=headers, data=body_str)
+    res_json = response.json()
 
     print("📡 ORDER:", body)
-    print("📡 RESPONSE:", response.json())
+    print("📡 RESPONSE:", res_json)
 
-    return response.json()
+    return res_json
 
 # ================================
 # 📊 MARKET
@@ -174,15 +177,16 @@ def scalp():
     if not position["open"]:
         if uptrend and volume_up:
 
-            place_order("buy", current_price)
+            order = place_order("buy", current_price)
 
-            position["open"] = True
-            position["entry_price"] = current_price
-            position["pair"] = PAIR
+            if order.get("code") == "0":
+                position["open"] = True
+                position["entry_price"] = current_price
+                position["pair"] = PAIR
 
-            log_trade(PAIR, "BUY", current_price, 0, "entry")
+                log_trade(PAIR, "BUY", current_price, 0, "entry")
 
-            return {"action": "BUY", "price": current_price}
+                return {"action": "BUY", "price": current_price}
 
         return {"action": "HOLD"}
 
@@ -193,28 +197,31 @@ def scalp():
     pnl = ((current_price - entry) / entry) * 100
 
     if pnl >= TAKE_PROFIT:
-        place_order("sell", current_price)
+        order = place_order("sell", current_price)
 
-        position["open"] = False
-        log_trade(PAIR, "SELL", current_price, pnl, "take profit")
+        if order.get("code") == "0":
+            position["open"] = False
+            log_trade(PAIR, "SELL", current_price, pnl, "take profit")
 
-        return {"action": "SELL", "pnl": round(pnl, 3)}
+            return {"action": "SELL", "pnl": round(pnl, 3)}
 
     if pnl <= STOP_LOSS:
-        place_order("sell", current_price)
+        order = place_order("sell", current_price)
 
-        position["open"] = False
-        log_trade(PAIR, "SELL", current_price, pnl, "stop loss")
+        if order.get("code") == "0":
+            position["open"] = False
+            log_trade(PAIR, "SELL", current_price, pnl, "stop loss")
 
-        return {"action": "SELL", "pnl": round(pnl, 3)}
+            return {"action": "SELL", "pnl": round(pnl, 3)}
 
     if downtrend:
-        place_order("sell", current_price)
+        order = place_order("sell", current_price)
 
-        position["open"] = False
-        log_trade(PAIR, "SELL", current_price, pnl, "reversal")
+        if order.get("code") == "0":
+            position["open"] = False
+            log_trade(PAIR, "SELL", current_price, pnl, "reversal")
 
-        return {"action": "SELL", "pnl": round(pnl, 3)}
+            return {"action": "SELL", "pnl": round(pnl, 3)}
 
     return {"action": "HOLD", "pnl": round(pnl, 3)}
 
