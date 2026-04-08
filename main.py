@@ -9,12 +9,29 @@ app = FastAPI()
 
 OKX_BASE = "https://www.okx.com"
 
+# ================================
 # 🔐 ENV VARIABLES
+# ================================
 API_TOKEN = os.getenv("API_TOKEN")
 OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
+# ================================
+# ⚙️ CONFIG SCALPING
+# ================================
+PAIR = "BTC-USDT"
+TAKE_PROFIT = 0.5   # %
+STOP_LOSS = -0.5    # %
+
+# ================================
+# 🧠 ESTADO (simples - memória)
+# ================================
+position = {
+    "open": False,
+    "entry_price": 0,
+    "pair": None
+}
 
 # ================================
 # 🔐 AUTH
@@ -23,7 +40,6 @@ def validate_token(auth):
     if auth != f"Bearer {API_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-
 # ================================
 # 🔐 OKX SIGNATURE
 # ================================
@@ -31,7 +47,6 @@ def sign(message, secret):
     return base64.b64encode(
         hmac.new(secret.encode(), message.encode(), digestmod="sha256").digest()
     ).decode()
-
 
 def get_headers(method, endpoint, body=""):
     timestamp = str(time.time())
@@ -46,132 +61,122 @@ def get_headers(method, endpoint, body=""):
         "Content-Type": "application/json"
     }
 
-
 # ================================
-# 🟢 HEALTH CHECK
+# 🟢 HEALTH
 # ================================
 @app.get("/")
 def home():
     return {"status": "running"}
 
-
 # ================================
-# 📊 MARKET (PÚBLICO)
+# 📊 MARKET
 # ================================
 @app.get("/market")
 def get_market(instId: str):
     url = f"{OKX_BASE}/api/v5/market/ticker?instId={instId}"
     return requests.get(url).json()
 
+# ================================
+# 📊 CANDLES 1M
+# ================================
+def get_candles(pair):
+    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar=1m&limit=5"
+    res = requests.get(url).json()
+
+    if not res.get("data"):
+        return None
+
+    candles = res["data"]
+
+    closes = [float(c[4]) for c in candles[:3]]
+    volumes = [float(c[5]) for c in candles[:3]]
+
+    return closes, volumes
 
 # ================================
-# 📊 MULTI MARKET
+# 🧠 SCALPING ENGINE
 # ================================
-@app.get("/multi-market")
-def get_multi_market():
-    pairs = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+@app.get("/scalp")
+def scalp():
 
-    results = []
+    global position
 
-    for pair in pairs:
-        url = f"{OKX_BASE}/api/v5/market/ticker?instId={pair}"
-        data = requests.get(url).json()
+    data = get_candles(PAIR)
 
-        if data.get("data"):
-            price = float(data["data"][0]["last"])
-            open24h = float(data["data"][0]["open24h"])
+    if not data:
+        return {"action": "NO_DATA"}
 
-            change = ((price - open24h) / open24h) * 100
+    closes, volumes = data
 
-            results.append({
-                "pair": pair,
-                "price": price,
-                "change_24h": round(change, 2)
-            })
+    current_price = closes[0]
 
-    return results
+    # 📈 tendência curta
+    uptrend = closes[2] < closes[1] < closes[0]
 
+    # 📉 tendência reversa
+    downtrend = closes[2] > closes[1] > closes[0]
 
-# ================================
-# 🚀 TOP GAINERS
-# ================================
-@app.get("/top-gainers")
-def top_gainers():
-    pairs = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT"]
+    # 💧 volume crescente
+    volume_up = volumes[2] < volumes[1] < volumes[0]
 
-    data = []
+    # ============================
+    # 🟢 ENTRADA
+    # ============================
+    if not position["open"]:
+        if uptrend and volume_up:
+            position["open"] = True
+            position["entry_price"] = current_price
+            position["pair"] = PAIR
 
-    for pair in pairs:
-        url = f"{OKX_BASE}/api/v5/market/ticker?instId={pair}"
-        res = requests.get(url).json()
+            return {
+                "action": "BUY",
+                "price": current_price,
+                "reason": "micro uptrend + volume"
+            }
 
-        if res.get("data"):
-            price = float(res["data"][0]["last"])
-            open24h = float(res["data"][0]["open24h"])
-
-            change = ((price - open24h) / open24h) * 100
-
-            data.append({
-                "pair": pair,
-                "price": price,
-                "change": round(change, 2)
-            })
-
-    sorted_data = sorted(data, key=lambda x: x["change"], reverse=True)
-
-    return sorted_data
-
-
-# ================================
-# 🔐 ACCOUNT (PRIVADO)
-# ================================
-@app.get("/account")
-def get_account(authorization: str = Header(None)):
-    validate_token(authorization)
-
-    endpoint = "/api/v5/account/balance"
-    url = OKX_BASE + endpoint
-
-    headers = get_headers("GET", endpoint)
-
-    response = requests.get(url, headers=headers)
-
-    return response.json()
-
-
-# ================================
-# 🧠 DECISION (BÁSICO)
-# ================================
-@app.post("/decision")
-def decision(data: dict, authorization: str = Header(None)):
-    validate_token(authorization)
-
-    change = float(data["change"])
-
-    if change > 1:
-        return {"action": "BUY"}
-    elif change < -1:
-        return {"action": "SELL"}
-    else:
         return {"action": "HOLD"}
 
+    # ============================
+    # 🔴 SAÍDA (GESTÃO)
+    # ============================
+    entry = position["entry_price"]
 
-# ================================
-# 🧠 DECISION V2 (MELHORADO)
-# ================================
-@app.post("/decision-v2")
-def decision_v2(data: dict, authorization: str = Header(None)):
-    validate_token(authorization)
+    pnl = ((current_price - entry) / entry) * 100
 
-    change = float(data["change"])
+    # TAKE PROFIT
+    if pnl >= TAKE_PROFIT:
+        position["open"] = False
 
-    if change > 2:
-        return {"action": "STRONG_BUY"}
-    elif change > 0.5:
-        return {"action": "BUY"}
-    elif change < -2:
-        return {"action": "STRONG_SELL"}
-    elif change < -0.5:
-        return {"action": "SELL"}
-    else:
-        return {"action": "HOLD"}
+        return {
+            "action": "SELL",
+            "price": current_price,
+            "pnl": round(pnl, 3),
+            "reason": "take profit"
+        }
+
+    # STOP LOSS
+    if pnl <= STOP_LOSS:
+        position["open"] = False
+
+        return {
+            "action": "SELL",
+            "price": current_price,
+            "pnl": round(pnl, 3),
+            "reason": "stop loss"
+        }
+
+    # REVERSÃO
+    if downtrend:
+        position["open"] = False
+
+        return {
+            "action": "SELL",
+            "price": current_price,
+            "pnl": round(pnl, 3),
+            "reason": "trend reversal"
+        }
+
+    return {
+        "action": "HOLD",
+        "pnl": round(pnl, 3)
+    }
