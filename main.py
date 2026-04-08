@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI
 import requests
 import os
 import time
@@ -16,19 +16,20 @@ OKX_BASE = "https://www.okx.com"
 # ================================
 # 🔐 ENV VARIABLES
 # ================================
-API_TOKEN = os.getenv("API_TOKEN")
 OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
 # ================================
-# ⚙️ CONFIG SCALPING
+# ⚙️ CONFIG
 # ================================
 PAIR = "BTC-USDT"
 ORDER_SIZE_USDT = 5
 TAKE_PROFIT = 0.7
 STOP_LOSS = -0.4
 DRY_RUN = False
+
+MIN_BTC_SIZE = 0.0001  # 🔥 mínimo OKX
 
 # ================================
 # 🧠 ESTADO
@@ -76,7 +77,7 @@ def log_trade(pair, action, price, pnl, reason):
     conn.close()
 
 # ================================
-# 🔐 OKX AUTH
+# 🔐 AUTH OKX
 # ================================
 def sign(message, secret):
     return base64.b64encode(
@@ -98,10 +99,17 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 SIZE
+# 📊 SIZE CORRETO
 # ================================
 def calculate_size(price):
-    return round(ORDER_SIZE_USDT / price, 6)
+    size = ORDER_SIZE_USDT / price
+
+    # garante mínimo
+    if size < MIN_BTC_SIZE:
+        size = MIN_BTC_SIZE
+
+    # força formato correto (sem notação científica)
+    return "{:.6f}".format(size)
 
 # ================================
 # 💰 EXECUÇÃO
@@ -121,7 +129,7 @@ def place_order(side, price):
         "tdMode": "cash",
         "side": side.lower(),
         "ordType": "market",
-        "sz": str(size)
+        "sz": size
     }
 
     body_str = json.dumps(body)
