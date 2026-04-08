@@ -25,8 +25,8 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 PAIR = "BTC-USDT"
 ORDER_SIZE_USDT = 5
-TAKE_PROFIT = 0.3
-STOP_LOSS = -0.3
+TAKE_PROFIT = 0.7
+STOP_LOSS = -0.4
 DRY_RUN = False  # 🔥 TRUE pra simular
 
 # ================================
