@@ -33,15 +33,7 @@ STOP_LOSS = -0.25
 DRY_RUN = False
 MIN_SIZE = 0.0001
 
-# ================================
-# 🧠 MULTI POSIÇÕES
-# ================================
-positions = {}  
-# exemplo:
-# {
-#   "BTC-USDT": {"entry_price": 65000},
-#   "ETH-USDT": {"entry_price": 3000}
-# }
+positions = {}
 
 # ================================
 # 🗄️ DATABASE
@@ -101,13 +93,24 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 SIZE
+# 🔥 NOVO: SALDO REAL
 # ================================
-def calculate_size(price):
-    size = ORDER_SIZE_USDT / price
-    if size < MIN_SIZE:
-        size = MIN_SIZE
-    return "{:.6f}".format(size)
+def get_balance(asset):
+    endpoint = "/api/v5/account/balance"
+    url = OKX_BASE + endpoint
+
+    headers = get_headers("GET", endpoint)
+
+    res = requests.get(url, headers=headers).json()
+
+    try:
+        for acc in res["data"][0]["details"]:
+            if acc["ccy"] == asset:
+                return float(acc["availBal"])
+    except:
+        return 0
+
+    return 0
 
 # ================================
 # 💰 ORDER
@@ -130,8 +133,18 @@ def place_order(side, price, pair):
             "sz": str(ORDER_SIZE_USDT),
             "tgtCcy": "quote_ccy"
         }
+
     else:
-        size = calculate_size(price)
+        base_asset = pair.split("-")[0]
+        balance = get_balance(base_asset)
+
+        if balance <= 0:
+            print(f"⚠️ Sem saldo para vender {pair}")
+            return {"code": "1"}
+
+        size = balance * 0.995
+        size = f"{size:.6f}"
+
         body = {
             "instId": pair,
             "tdMode": "cash",
@@ -168,7 +181,7 @@ def get_candles(pair):
     return closes, volumes
 
 # ================================
-# 🧠 GERENCIAR TODAS POSIÇÕES
+# 🧠 GERENCIAR POSIÇÕES
 # ================================
 def manage_positions():
 
@@ -188,7 +201,6 @@ def manage_positions():
 
         print(f"📈 {pair} pnl={pnl:.4f}")
 
-        # TAKE PROFIT
         if pnl >= TAKE_PROFIT:
             order = place_order("sell", current_price, pair)
 
@@ -197,7 +209,6 @@ def manage_positions():
                 del positions[pair]
                 print(f"💰 TP SELL {pair}")
 
-        # STOP LOSS
         elif pnl <= STOP_LOSS:
             order = place_order("sell", current_price, pair)
 
@@ -207,7 +218,7 @@ def manage_positions():
                 print(f"🛑 SL SELL {pair}")
 
 # ================================
-# 🧠 SCANNER + ENTRY
+# 🧠 SCANNER
 # ================================
 def scan_market():
 
@@ -215,7 +226,6 @@ def scan_market():
 
     for pair in PAIRS:
 
-        # já está comprado? pula
         if pair in positions:
             continue
 
@@ -261,8 +271,8 @@ def scan_market():
 def trading_loop():
     while True:
         try:
-            manage_positions()  # 🔥 gerencia TODAS
-            scan_market()       # 🔥 continua comprando
+            manage_positions()
+            scan_market()
 
         except Exception as e:
             print("❌ ERRO:", str(e))
