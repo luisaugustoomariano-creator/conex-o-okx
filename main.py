@@ -4,6 +4,7 @@ import os
 import time
 import hmac
 import base64
+import threading
 
 app = FastAPI()
 
@@ -180,3 +181,28 @@ def scalp():
         "action": "HOLD",
         "pnl": round(pnl, 3)
     }
+
+# ================================
+# 🔁 LOOP AUTOMÁTICO
+# ================================
+def trading_loop():
+    while True:
+        try:
+            result = scalp()
+            print("🤖 BOT:", result)
+
+        except Exception as e:
+            print("❌ ERRO NO LOOP:", str(e))
+
+        time.sleep(15)  # executa a cada 15 segundos
+
+# ================================
+# 🚀 START AUTOMÁTICO
+# ================================
+@app.on_event("startup")
+def start_bot():
+    thread = threading.Thread(target=trading_loop)
+    thread.daemon = True
+    thread.start()
+
+    print("🚀 BOT INICIADO")
