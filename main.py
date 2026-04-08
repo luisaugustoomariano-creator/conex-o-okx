@@ -25,8 +25,7 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
-# 🔥 AUMENTADO + MARGEM
-ORDER_SIZE_USDT = 15
+ORDER_SIZE_USDT = 12  # 💰 FIXO PRA TODAS
 
 TAKE_PROFIT = 0.7
 STOP_LOSS = -0.3
@@ -101,39 +100,18 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 📊 SIZE INTELIGENTE (CORRIGIDO)
+# 📊 CALCULAR QUANTIDADE (SELL)
 # ================================
-def calculate_size(price, pair):
+def calculate_size(price):
+    size = ORDER_SIZE_USDT / price
 
-    base_usdt_map = {
-        "BTC-USDT": 15,
-        "ETH-USDT": 30,
-        "SOL-USDT": 25
-    }
-
-    base_usdt = base_usdt_map.get(pair, 20)
-
-    # margem segurança
-    safe_usdt = base_usdt * 1.2
-
-    raw_size = safe_usdt / price
-
-    # 🔥 STEP SIZE SIMPLES (FUNCIONA NA PRÁTICA)
-    if pair == "BTC-USDT":
-        size = round(raw_size, 6)
-    elif pair == "ETH-USDT":
-        size = round(raw_size, 5)
-    else:
-        size = round(raw_size, 3)
-
-    # mínimo absoluto
     if size < MIN_SIZE:
         size = MIN_SIZE
 
-    return str(size)
+    return "{:.6f}".format(size)
 
 # ================================
-# 💰 EXECUÇÃO
+# 💰 EXECUÇÃO CORRIGIDA
 # ================================
 def place_order(side, price, pair):
 
@@ -144,15 +122,30 @@ def place_order(side, price, pair):
     endpoint = "/api/v5/trade/order"
     url = OKX_BASE + endpoint
 
-    size = calculate_size(price, pair)
+    # 🔥 BUY = USDT
+    if side.lower() == "buy":
 
-    body = {
-        "instId": pair,
-        "tdMode": "cash",
-        "side": side.lower(),
-        "ordType": "market",
-        "sz": size
-    }
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "buy",
+            "ordType": "market",
+            "sz": str(ORDER_SIZE_USDT),  # 💰 USDT
+            "tgtCcy": "quote_ccy"
+        }
+
+    # 🔥 SELL = quantidade
+    else:
+
+        size = calculate_size(price)
+
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "market",
+            "sz": size
+        }
 
     body_str = json.dumps(body)
     headers = get_headers("POST", endpoint, body_str)
