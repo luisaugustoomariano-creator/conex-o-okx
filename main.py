@@ -103,17 +103,34 @@ def get_headers(method, endpoint, body=""):
 # ================================
 # 📊 SIZE INTELIGENTE (CORRIGIDO)
 # ================================
-def calculate_size(price):
+def calculate_size(price, pair):
 
-    # 🔥 margem de segurança 10%
-    safe_usdt = ORDER_SIZE_USDT * 1.1
+    base_usdt_map = {
+        "BTC-USDT": 15,
+        "ETH-USDT": 30,
+        "SOL-USDT": 25
+    }
 
-    size = safe_usdt / price
+    base_usdt = base_usdt_map.get(pair, 20)
 
+    # margem segurança
+    safe_usdt = base_usdt * 1.2
+
+    raw_size = safe_usdt / price
+
+    # 🔥 STEP SIZE SIMPLES (FUNCIONA NA PRÁTICA)
+    if pair == "BTC-USDT":
+        size = round(raw_size, 6)
+    elif pair == "ETH-USDT":
+        size = round(raw_size, 5)
+    else:
+        size = round(raw_size, 3)
+
+    # mínimo absoluto
     if size < MIN_SIZE:
         size = MIN_SIZE
 
-    return "{:.6f}".format(size)
+    return str(size)
 
 # ================================
 # 💰 EXECUÇÃO
