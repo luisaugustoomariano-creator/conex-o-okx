@@ -93,18 +93,18 @@ def get_headers(method, endpoint, body=""):
 # 💰 BALANCE
 # ================================
 def get_balance(asset):
-    endpoint = "/api/v5/account/balance"
-    url = OKX_BASE + endpoint
-
-    headers = get_headers("GET", endpoint)
-    res = requests.get(url, headers=headers).json()
-
     try:
+        endpoint = "/api/v5/account/balance"
+        url = OKX_BASE + endpoint
+
+        headers = get_headers("GET", endpoint)
+        res = requests.get(url, headers=headers).json()
+
         for acc in res["data"][0]["details"]:
             if acc["ccy"] == asset:
                 return float(acc["availBal"])
-    except:
-        return 0
+    except Exception as e:
+        print("❌ ERRO BALANCE:", e)
 
     return 0
 
@@ -125,6 +125,7 @@ def calculate_order_size():
     if size > balance:
         size = balance * 0.99
 
+    print(f"💰 ORDER SIZE: {size}")
     return round(size, 2)
 
 # ================================
@@ -136,67 +137,71 @@ def place_order(side, price, pair):
         print(f"🧪 DRY RUN: {side} {pair} @ {price}")
         return {"code": "0"}
 
-    endpoint = "/api/v5/trade/order"
-    url = OKX_BASE + endpoint
+    try:
+        endpoint = "/api/v5/trade/order"
+        url = OKX_BASE + endpoint
 
-    if side.lower() == "buy":
+        if side.lower() == "buy":
+            size = calculate_order_size()
 
-        size = calculate_order_size()
+            body = {
+                "instId": pair,
+                "tdMode": "cash",
+                "side": "buy",
+                "ordType": "market",
+                "sz": str(size),
+                "tgtCcy": "quote_ccy"
+            }
 
-        body = {
-            "instId": pair,
-            "tdMode": "cash",
-            "side": "buy",
-            "ordType": "market",
-            "sz": str(size),
-            "tgtCcy": "quote_ccy"
-        }
+        else:
+            base_asset = pair.split("-")[0]
+            balance = get_balance(base_asset)
 
-    else:
-        base_asset = pair.split("-")[0]
-        balance = get_balance(base_asset)
+            if balance <= 0:
+                print(f"⚠️ Sem saldo para vender {pair}")
+                return {"code": "1"}
 
-        if balance <= 0:
-            print(f"⚠️ Sem saldo para vender {pair}")
-            return {"code": "1"}
+            size = f"{balance * 0.995:.6f}"
 
-        size = balance * 0.995
-        size = f"{size:.6f}"
+            body = {
+                "instId": pair,
+                "tdMode": "cash",
+                "side": "sell",
+                "ordType": "market",
+                "sz": size
+            }
 
-        body = {
-            "instId": pair,
-            "tdMode": "cash",
-            "side": "sell",
-            "ordType": "market",
-            "sz": size
-        }
+        body_str = json.dumps(body)
+        headers = get_headers("POST", endpoint, body_str)
 
-    body_str = json.dumps(body)
-    headers = get_headers("POST", endpoint, body_str)
+        response = requests.post(url, headers=headers, data=body_str)
+        res_json = response.json()
 
-    response = requests.post(url, headers=headers, data=body_str)
-    res_json = response.json()
+        print("📡 ORDER:", body)
+        print("📡 RESPONSE:", res_json)
 
-    print("📡 ORDER:", body)
-    print("📡 RESPONSE:", res_json)
+        return res_json
 
-    return res_json
+    except Exception as e:
+        print("❌ ERRO ORDER:", e)
+        return {"code": "1"}
 
 # ================================
 # 📊 MARKET
 # ================================
 def get_candles(pair, timeframe="1m", limit=5):
-    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
-    res = requests.get(url).json()
+    try:
+        url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
+        res = requests.get(url).json()
 
-    if not res.get("data"):
+        candles = res["data"]
+        closes = [float(c[4]) for c in candles]
+        volumes = [float(c[5]) for c in candles]
+
+        return closes, volumes
+    except Exception as e:
+        print("❌ ERRO CANDLES:", e)
         return None
-
-    candles = res["data"]
-    closes = [float(c[4]) for c in candles]
-    volumes = [float(c[5]) for c in candles]
-
-    return closes, volumes
 
 # ================================
 # 📈 TREND
@@ -211,18 +216,7 @@ def get_trend(pair):
     sma_short = sum(closes[:5]) / 5
     sma_long = sum(closes[:20]) / 20
 
-    if sma_short > sma_long:
-        return "up"
-    elif sma_short < sma_long:
-        return "down"
-    return "range"
-
-# ================================
-# 📊 ATR
-# ================================
-def calculate_atr(closes):
-    trs = [abs(closes[i] - closes[i+1]) for i in range(len(closes)-1)]
-    return sum(trs) / len(trs)
+    return "up" if sma_short > sma_long else "down"
 
 # ================================
 # 🧠 MANAGE POSITIONS
@@ -230,8 +224,9 @@ def calculate_atr(closes):
 def manage_positions():
     global positions
 
-    for pair in list(positions.keys()):
+    print("🧠 MANAGING POSITIONS:", positions)
 
+    for pair in list(positions.keys()):
         data = get_candles(pair)
         if not data:
             continue
@@ -240,25 +235,20 @@ def manage_positions():
         current_price = closes[0]
 
         pos = positions[pair]
-        entry = pos["entry_price"]
 
-        pnl = ((current_price - entry) / entry) * 100
-
-        # update max price (trailing)
         if current_price > pos["max_price"]:
             pos["max_price"] = current_price
 
         drawdown = ((current_price - pos["max_price"]) / pos["max_price"]) * 100
 
-        print(f"📈 {pair} pnl={pnl:.4f} drawdown={drawdown:.4f}")
+        print(f"📉 {pair} drawdown={drawdown:.4f}")
 
-        # trailing stop
         if drawdown <= -0.3:
             order = place_order("sell", current_price, pair)
+
             if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, pnl, "trailing_stop")
+                log_trade(pair, "SELL", current_price, 0, "trailing_stop")
                 del positions[pair]
-                print(f"🔻 TRAILING STOP {pair}")
 
 # ================================
 # 🧠 SCANNER
@@ -267,6 +257,8 @@ def scan_market():
     global positions
 
     for pair in PAIRS:
+
+        print(f"🔍 SCANNING {pair}")
 
         if pair in positions:
             continue
@@ -282,7 +274,6 @@ def scan_market():
 
         closes, volumes = data[:3]
 
-        # filtro de ruído
         if abs(closes[0] - closes[1]) / closes[1] < 0.002:
             continue
 
@@ -293,17 +284,14 @@ def scan_market():
 
         if delta1 > 0:
             score += 1
-
         if delta1 > delta2:
             score += 1
-
         if volumes[0] > volumes[1] * 1.2:
             score += 2
-
         if (delta1 / closes[1]) > 0.002:
             score += 1
 
-        print(f"📊 {pair} score={score} trend={trend}")
+        print(f"📊 {pair} score={score}")
 
         if score >= 3:
             price = closes[0]
@@ -311,7 +299,6 @@ def scan_market():
             order = place_order("buy", price, pair)
 
             if order.get("code") == "0":
-
                 positions[pair] = {
                     "entry_price": price,
                     "max_price": price
@@ -319,27 +306,42 @@ def scan_market():
 
                 log_trade(pair, "BUY", price, 0, f"score={score}")
 
-                print(f"🚀 BUY {pair}")
-
 # ================================
 # 🔁 LOOP
 # ================================
 def trading_loop():
+    print("🚀 BOT STARTED")
+
     while True:
         try:
+            print("🔁 LOOP EXECUTANDO...")
             manage_positions()
             scan_market()
+
         except Exception as e:
-            print("❌ ERRO:", str(e))
+            print("❌ ERRO LOOP:", str(e))
 
         time.sleep(15)
+
+# ================================
+# 🌐 HEALTHCHECK
+# ================================
+@app.get("/health")
+def health():
+    return {"status": "running", "positions": positions}
+
+@app.get("/positions")
+def get_positions():
+    return positions
 
 # ================================
 # 🚀 START
 # ================================
 @app.on_event("startup")
 def start_bot():
+    print("🔥 STARTUP INICIADO")
+
     init_db()
 
-    thread = threading.Thread(target=trading_loop)
+    thread = threading.Thread(target=trading_loop, daemon=True)
     thread.start()
