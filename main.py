@@ -7,9 +7,20 @@ import base64
 import threading
 import json
 import psycopg2
+import logging
 from datetime import datetime, timezone
 
 app = FastAPI()
+
+# ================================
+# 🧠 LOGGER PROFISSIONAL
+# ================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
 
 OKX_BASE = "https://www.okx.com"
 
@@ -35,11 +46,9 @@ PAIRS = [
 ]
 
 DRY_RUN = False
-
 MIN_ORDER_USDT = 10
 RISK_PER_TRADE = 0.02
 
-# 🔥 NOVA ESTRATÉGIA
 STOP_LOSS = 0.01
 TRAILING_STOP = 0.03
 MIN_DELTA = 0.01
@@ -47,18 +56,25 @@ MIN_DELTA = 0.01
 positions = {}
 
 # ================================
-# 🗄️ DATABASE (POSTGRES)
+# 🗄️ DATABASE
 # ================================
 def get_db_connection():
-    return psycopg2.connect(
-        host=os.getenv("PGHOST"),
-        database=os.getenv("PGDATABASE"),
-        user=os.getenv("PGUSER"),
-        password=os.getenv("PGPASSWORD"),
-        port=os.getenv("PGPORT")
-    )
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("PGHOST"),
+            database=os.getenv("PGDATABASE"),
+            user=os.getenv("PGUSER"),
+            password=os.getenv("PGPASSWORD"),
+            port=os.getenv("PGPORT")
+        )
+        logger.info("✅ Conectado ao PostgreSQL")
+        return conn
+    except Exception as e:
+        logger.error(f"❌ ERRO DB CONNECTION: {e}")
+        raise
 
 def init_db():
+    logger.info("🚀 Inicializando banco...")
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -78,7 +94,10 @@ def init_db():
     cursor.close()
     conn.close()
 
+    logger.info("✅ Tabela pronta")
+
 def log_trade(pair, action, price, pnl, reason):
+    logger.info(f"📊 TRADE → {pair} | {action} | price={price} | pnl={pnl} | {reason}")
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -92,8 +111,10 @@ def log_trade(pair, action, price, pnl, reason):
         cursor.close()
         conn.close()
 
+        logger.info("✅ Trade salvo no banco")
+
     except Exception as e:
-        print("❌ ERRO DB:", e)
+        logger.error(f"❌ ERRO AO SALVAR TRADE: {e}")
 
 # ================================
 # 🔐 OKX AUTH
@@ -129,14 +150,16 @@ def get_balance(asset):
 
         for acc in res["data"][0]["details"]:
             if acc["ccy"] == asset:
-                return float(acc["availBal"])
+                balance = float(acc["availBal"])
+                logger.info(f"💰 Balance {asset}: {balance}")
+                return balance
     except Exception as e:
-        print("❌ ERRO BALANCE:", e)
+        logger.error(f"❌ ERRO BALANCE: {e}")
 
     return 0
 
 # ================================
-# 🧠 POSITION SIZE
+# 🧠 ORDER SIZE
 # ================================
 def calculate_order_size():
     balance = get_balance("USDT")
@@ -152,7 +175,7 @@ def calculate_order_size():
     if size > balance:
         size = balance * 0.99
 
-    print(f"💰 ORDER SIZE: {size}")
+    logger.info(f"💰 ORDER SIZE: {size}")
     return round(size, 2)
 
 # ================================
@@ -160,8 +183,10 @@ def calculate_order_size():
 # ================================
 def place_order(side, price, pair):
 
+    logger.info(f"📤 ORDER → {side} {pair} @ {price}")
+
     if DRY_RUN:
-        print(f"🧪 DRY RUN: {side} {pair} @ {price}")
+        logger.info("🧪 DRY RUN")
         return {"code": "0"}
 
     try:
@@ -185,6 +210,7 @@ def place_order(side, price, pair):
             balance = get_balance(base_asset)
 
             if balance <= 0:
+                logger.warning("⚠️ Sem saldo pra vender")
                 return {"code": "1"}
 
             size = f"{balance * 0.995:.6f}"
@@ -203,10 +229,12 @@ def place_order(side, price, pair):
         response = requests.post(url, headers=headers, data=body_str)
         res_json = response.json()
 
+        logger.info(f"📡 RESPONSE: {res_json}")
+
         return res_json
 
     except Exception as e:
-        print("❌ ERRO ORDER:", e)
+        logger.error(f"❌ ERRO ORDER: {e}")
         return {"code": "1"}
 
 # ================================
@@ -221,8 +249,10 @@ def get_candles(pair, timeframe="1m", limit=5):
         closes = [float(c[4]) for c in candles]
         volumes = [float(c[5]) for c in candles]
 
+        logger.info(f"📈 {pair} candles OK")
         return closes, volumes
-    except:
+    except Exception as e:
+        logger.error(f"❌ ERRO CANDLES {pair}: {e}")
         return None
 
 # ================================
@@ -239,7 +269,10 @@ def get_trend(pair):
     sma_short = sum(closes[-5:]) / 5
     sma_long = sum(closes) / 20
 
-    return "up" if sma_short > sma_long else "down"
+    trend = "up" if sma_short > sma_long else "down"
+    logger.info(f"📊 Trend {pair}: {trend}")
+
+    return trend
 
 # ================================
 # 🧠 MANAGE POSITIONS
@@ -265,15 +298,17 @@ def manage_positions():
 
         profit = (current_price - entry) / entry
 
-        # STOP LOSS
+        logger.info(f"📊 {pair} | entry={entry} | current={current_price} | pnl={profit}")
+
         if current_price <= entry * (1 - STOP_LOSS):
+            logger.warning(f"🛑 STOP LOSS {pair}")
             order = place_order("sell", current_price, pair)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, "stop_loss")
                 del positions[pair]
 
-        # TRAILING
         elif current_price <= max_price * (1 - TRAILING_STOP):
+            logger.warning(f"📉 TRAILING STOP {pair}")
             order = place_order("sell", current_price, pair)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, "trailing_stop")
@@ -307,7 +342,10 @@ def scan_market():
         volume_boost = volumes[0] > volumes[1] * 1.1
         volatility = (max(closes) - min(closes)) / closes[-1]
 
+        logger.info(f"🔎 {pair} | delta={delta} | vol={volume_boost} | volat={volatility}")
+
         if delta >= MIN_DELTA and volume_boost and volatility > 0.004:
+            logger.info(f"🟢 COMPRA {pair}")
 
             order = place_order("buy", price, pair)
 
@@ -323,12 +361,14 @@ def scan_market():
 # LOOP
 # ================================
 def trading_loop():
+    logger.info("🚀 BOT INICIADO")
+
     while True:
         try:
             manage_positions()
             scan_market()
         except Exception as e:
-            print("❌ LOOP:", e)
+            logger.error(f"💥 LOOP ERROR: {e}")
 
         time.sleep(15)
 
@@ -337,6 +377,8 @@ def trading_loop():
 # ================================
 @app.on_event("startup")
 def start_bot():
+    logger.info("🔥 STARTUP")
+
     init_db()
 
     thread = threading.Thread(target=trading_loop, daemon=True)
