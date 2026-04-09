@@ -23,7 +23,7 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 # ⚙️ CONFIG
 # ================================
-PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT", "AVAX-USDT"]
 
 DRY_RUN = False
 
