@@ -25,13 +25,10 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 
-ORDER_SIZE_USDT = 12
-
-TAKE_PROFIT = 0.50
-STOP_LOSS = -0.25
-
 DRY_RUN = False
-MIN_SIZE = 0.0001
+
+MIN_ORDER_USDT = 10
+RISK_PER_TRADE = 0.02
 
 positions = {}
 
@@ -93,14 +90,13 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 🔥 NOVO: SALDO REAL
+# 💰 BALANCE
 # ================================
 def get_balance(asset):
     endpoint = "/api/v5/account/balance"
     url = OKX_BASE + endpoint
 
     headers = get_headers("GET", endpoint)
-
     res = requests.get(url, headers=headers).json()
 
     try:
@@ -111,6 +107,25 @@ def get_balance(asset):
         return 0
 
     return 0
+
+# ================================
+# 🧠 POSITION SIZE
+# ================================
+def calculate_order_size():
+    balance = get_balance("USDT")
+
+    if balance <= 0:
+        return 0
+
+    size = balance * RISK_PER_TRADE
+
+    if size < MIN_ORDER_USDT:
+        size = MIN_ORDER_USDT
+
+    if size > balance:
+        size = balance * 0.99
+
+    return round(size, 2)
 
 # ================================
 # 💰 ORDER
@@ -125,12 +140,15 @@ def place_order(side, price, pair):
     url = OKX_BASE + endpoint
 
     if side.lower() == "buy":
+
+        size = calculate_order_size()
+
         body = {
             "instId": pair,
             "tdMode": "cash",
             "side": "buy",
             "ordType": "market",
-            "sz": str(ORDER_SIZE_USDT),
+            "sz": str(size),
             "tgtCcy": "quote_ccy"
         }
 
@@ -167,24 +185,49 @@ def place_order(side, price, pair):
 # ================================
 # 📊 MARKET
 # ================================
-def get_candles(pair):
-    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar=1m&limit=5"
+def get_candles(pair, timeframe="1m", limit=5):
+    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
     res = requests.get(url).json()
 
     if not res.get("data"):
         return None
 
     candles = res["data"]
-    closes = [float(c[4]) for c in candles[:3]]
-    volumes = [float(c[5]) for c in candles[:3]]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
 
     return closes, volumes
 
 # ================================
-# 🧠 GERENCIAR POSIÇÕES
+# 📈 TREND
+# ================================
+def get_trend(pair):
+    data = get_candles(pair, "5m", 20)
+    if not data:
+        return "range"
+
+    closes, _ = data
+
+    sma_short = sum(closes[:5]) / 5
+    sma_long = sum(closes[:20]) / 20
+
+    if sma_short > sma_long:
+        return "up"
+    elif sma_short < sma_long:
+        return "down"
+    return "range"
+
+# ================================
+# 📊 ATR
+# ================================
+def calculate_atr(closes):
+    trs = [abs(closes[i] - closes[i+1]) for i in range(len(closes)-1)]
+    return sum(trs) / len(trs)
+
+# ================================
+# 🧠 MANAGE POSITIONS
 # ================================
 def manage_positions():
-
     global positions
 
     for pair in list(positions.keys()):
@@ -196,32 +239,31 @@ def manage_positions():
         closes, _ = data
         current_price = closes[0]
 
-        entry = positions[pair]["entry_price"]
+        pos = positions[pair]
+        entry = pos["entry_price"]
+
         pnl = ((current_price - entry) / entry) * 100
 
-        print(f"📈 {pair} pnl={pnl:.4f}")
+        # update max price (trailing)
+        if current_price > pos["max_price"]:
+            pos["max_price"] = current_price
 
-        if pnl >= TAKE_PROFIT:
+        drawdown = ((current_price - pos["max_price"]) / pos["max_price"]) * 100
+
+        print(f"📈 {pair} pnl={pnl:.4f} drawdown={drawdown:.4f}")
+
+        # trailing stop
+        if drawdown <= -0.3:
             order = place_order("sell", current_price, pair)
-
             if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, pnl, "tp")
+                log_trade(pair, "SELL", current_price, pnl, "trailing_stop")
                 del positions[pair]
-                print(f"💰 TP SELL {pair}")
-
-        elif pnl <= STOP_LOSS:
-            order = place_order("sell", current_price, pair)
-
-            if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, pnl, "sl")
-                del positions[pair]
-                print(f"🛑 SL SELL {pair}")
+                print(f"🔻 TRAILING STOP {pair}")
 
 # ================================
 # 🧠 SCANNER
 # ================================
 def scan_market():
-
     global positions
 
     for pair in PAIRS:
@@ -229,27 +271,39 @@ def scan_market():
         if pair in positions:
             continue
 
+        trend = get_trend(pair)
+
+        if trend != "up":
+            continue
+
         data = get_candles(pair)
         if not data:
             continue
 
-        closes, volumes = data
+        closes, volumes = data[:3]
+
+        # filtro de ruído
+        if abs(closes[0] - closes[1]) / closes[1] < 0.002:
+            continue
 
         score = 0
 
-        if closes[1] < closes[0]:
+        delta1 = closes[0] - closes[1]
+        delta2 = closes[1] - closes[2]
+
+        if delta1 > 0:
             score += 1
 
-        if closes[2] < closes[1] < closes[0]:
-            score += 2
-
-        if volumes[1] < volumes[0]:
+        if delta1 > delta2:
             score += 1
 
-        if volumes[2] < volumes[1] < volumes[0]:
+        if volumes[0] > volumes[1] * 1.2:
             score += 2
 
-        print(f"📊 {pair} score={score}")
+        if (delta1 / closes[1]) > 0.002:
+            score += 1
+
+        print(f"📊 {pair} score={score} trend={trend}")
 
         if score >= 3:
             price = closes[0]
@@ -257,8 +311,10 @@ def scan_market():
             order = place_order("buy", price, pair)
 
             if order.get("code") == "0":
+
                 positions[pair] = {
-                    "entry_price": price
+                    "entry_price": price,
+                    "max_price": price
                 }
 
                 log_trade(pair, "BUY", price, 0, f"score={score}")
@@ -273,7 +329,6 @@ def trading_loop():
         try:
             manage_positions()
             scan_market()
-
         except Exception as e:
             print("❌ ERRO:", str(e))
 
