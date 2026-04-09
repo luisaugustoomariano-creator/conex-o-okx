@@ -30,6 +30,11 @@ DRY_RUN = False
 MIN_ORDER_USDT = 10
 RISK_PER_TRADE = 0.02
 
+# ESTRATÉGIA (com taxa considerada ~0.2%)
+TAKE_PROFIT = 0.005    # 0.5%
+STOP_LOSS   = -0.0025  # -0.25%
+TRAILING    = -0.006   # -0.6%
+
 positions = {}
 
 # ================================
@@ -204,7 +209,7 @@ def get_candles(pair, timeframe="1m", limit=5):
         return None
 
 # ================================
-# 📈 TREND
+# 📈 TREND (CORRIGIDO)
 # ================================
 def get_trend(pair):
     data = get_candles(pair, "5m", 20)
@@ -212,14 +217,15 @@ def get_trend(pair):
         return "range"
 
     closes, _ = data
+    closes = list(reversed(closes))
 
-    sma_short = sum(closes[:5]) / 5
-    sma_long = sum(closes[:20]) / 20
+    sma_short = sum(closes[-5:]) / 5
+    sma_long = sum(closes) / 20
 
     return "up" if sma_short > sma_long else "down"
 
 # ================================
-# 🧠 MANAGE POSITIONS
+# 🧠 MANAGE POSITIONS (TP/SL)
 # ================================
 def manage_positions():
     global positions
@@ -235,23 +241,36 @@ def manage_positions():
         current_price = closes[0]
 
         pos = positions[pair]
+        entry = pos["entry_price"]
 
         if current_price > pos["max_price"]:
             pos["max_price"] = current_price
 
-        drawdown = ((current_price - pos["max_price"]) / pos["max_price"]) * 100
+        profit = (current_price - entry) / entry
+        drawdown = (current_price - pos["max_price"]) / pos["max_price"]
 
-        print(f"📉 {pair} drawdown={drawdown:.4f}")
+        print(f"📊 {pair} profit={profit:.4f} drawdown={drawdown:.4f}")
 
-        if drawdown <= -0.3:
+        if profit >= TAKE_PROFIT:
             order = place_order("sell", current_price, pair)
-
             if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, 0, "trailing_stop")
+                log_trade(pair, "SELL", current_price, profit, "take_profit")
+                del positions[pair]
+
+        elif profit <= STOP_LOSS:
+            order = place_order("sell", current_price, pair)
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, profit, "stop_loss")
+                del positions[pair]
+
+        elif drawdown <= TRAILING:
+            order = place_order("sell", current_price, pair)
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, profit, "trailing_stop")
                 del positions[pair]
 
 # ================================
-# 🧠 SCANNER
+# 🧠 SCANNER (NOVA ESTRATÉGIA)
 # ================================
 def scan_market():
     global positions
@@ -264,7 +283,6 @@ def scan_market():
             continue
 
         trend = get_trend(pair)
-
         if trend != "up":
             continue
 
@@ -272,29 +290,27 @@ def scan_market():
         if not data:
             continue
 
-        closes, volumes = data[:3]
+        closes, volumes = data
 
-        if abs(closes[0] - closes[1]) / closes[1] < 0.002:
+        price = closes[0]
+        prev_price = closes[1]
+
+        delta = (price - prev_price) / prev_price
+        volume_boost = volumes[0] > volumes[1]
+        volatility = (max(closes) - min(closes)) / min(closes)
+
+        print(f"""
+📊 {pair}
+TREND: {trend}
+DELTA: {delta:.4f}
+VOLUME: {volume_boost}
+VOLATILITY: {volatility:.4f}
+""")
+
+        if volatility < 0.002:
             continue
 
-        score = 0
-
-        delta1 = closes[0] - closes[1]
-        delta2 = closes[1] - closes[2]
-
-        if delta1 > 0:
-            score += 1
-        if delta1 > delta2:
-            score += 1
-        if volumes[0] > volumes[1] * 1.2:
-            score += 2
-        if (delta1 / closes[1]) > 0.002:
-            score += 1
-
-        print(f"📊 {pair} score={score}")
-
-        if score >= 3:
-            price = closes[0]
+        if delta > 0.001 and volume_boost:
 
             order = place_order("buy", price, pair)
 
@@ -304,7 +320,7 @@ def scan_market():
                     "max_price": price
                 }
 
-                log_trade(pair, "BUY", price, 0, f"score={score}")
+                log_trade(pair, "BUY", price, 0, "trend_momentum")
 
 # ================================
 # 🔁 LOOP
