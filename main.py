@@ -23,15 +23,23 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 # ================================
 # ⚙️ CONFIG
 # ================================
-PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "DOGE-USDT", "AVAX-USDT"]
+PAIRS = [
+    "BTC-USDT", "ETH-USDT", "SOL-USDT",
+    "XRP-USDT", "DOGE-USDT", "AVAX-USDT",
+    "LINK-USDT", "MATIC-USDT", "ADA-USDT",
+    "ARB-USDT", "OP-USDT", "NEAR-USDT",
+    "APT-USDT", "SUI-USDT", "ATOM-USDT",
+    "LTC-USDT", "UNI-USDT", "FIL-USDT",
+    "INJ-USDT", "PEPE-USDT"
+]
 
 DRY_RUN = False
 
 MIN_ORDER_USDT = 10
 RISK_PER_TRADE = 0.02
 
-# ESTRATÉGIA (com taxa considerada ~0.2%)
-TAKE_PROFIT = 0.005    # 0.5%
+# ESTRATÉGIA
+TAKE_PROFIT = 0.006    # 0.6%
 STOP_LOSS   = -0.0025  # -0.25%
 TRAILING    = -0.006   # -0.6%
 
@@ -209,7 +217,7 @@ def get_candles(pair, timeframe="1m", limit=5):
         return None
 
 # ================================
-# 📈 TREND (CORRIGIDO)
+# 📈 TREND
 # ================================
 def get_trend(pair):
     data = get_candles(pair, "5m", 20)
@@ -225,7 +233,7 @@ def get_trend(pair):
     return "up" if sma_short > sma_long else "down"
 
 # ================================
-# 🧠 MANAGE POSITIONS (TP/SL)
+# 🧠 MANAGE POSITIONS
 # ================================
 def manage_positions():
     global positions
@@ -270,7 +278,7 @@ def manage_positions():
                 del positions[pair]
 
 # ================================
-# 🧠 SCANNER (NOVA ESTRATÉGIA)
+# 🧠 SCANNER
 # ================================
 def scan_market():
     global positions
@@ -296,14 +304,17 @@ def scan_market():
         prev_price = closes[1]
 
         delta = (price - prev_price) / prev_price
-        volume_boost = volumes[0] > volumes[1]
-        volatility = (max(closes) - min(closes)) / min(closes)
+        delta_pct = delta * 100
+
+        volume_boost = volumes[0] > volumes[1] * 1.1
+
+        volatility = (max(closes) - min(closes)) / closes[-1]
 
         print(f"""
 📊 {pair}
 TREND: {trend}
-DELTA: {delta:.4f}
-VOLUME: {volume_boost}
+DELTA: {delta:.4f} ({delta_pct:.2f}%)
+VOLUME BOOST: {volume_boost}
 VOLATILITY: {volatility:.4f}
 """)
 
@@ -338,17 +349,6 @@ def trading_loop():
             print("❌ ERRO LOOP:", str(e))
 
         time.sleep(15)
-
-# ================================
-# 🌐 HEALTHCHECK
-# ================================
-@app.get("/health")
-def health():
-    return {"status": "running", "positions": positions}
-
-@app.get("/positions")
-def get_positions():
-    return positions
 
 # ================================
 # 🚀 START
