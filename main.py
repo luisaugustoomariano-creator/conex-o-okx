@@ -30,7 +30,8 @@ PAIRS = [
     "ARB-USDT", "OP-USDT", "NEAR-USDT",
     "APT-USDT", "SUI-USDT", "ATOM-USDT",
     "LTC-USDT", "UNI-USDT", "FIL-USDT",
-    "INJ-USDT", "PEPE-USDT"
+    "INJ-USDT", "PEPE-USDT", "WIF-USDT",
+    "BONK-USDT", "FLOKI-USDT",
 ]
 
 DRY_RUN = False
