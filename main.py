@@ -355,17 +355,35 @@ def stop_bot():
     bot_running = False
     return {"message": "stopped"}
 
+from fastapi import Query
+
 @app.get("/logs")
-def logs():
+def logs(start: str = Query(None), end: str = Query(None)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    query = """
         SELECT pair, action, price, pnl, reason, created_at
         FROM trades
-        ORDER BY created_at DESC
-        LIMIT 20
-    """)
+    """
+
+    conditions = []
+    values = []
+
+    if start:
+        conditions.append("created_at >= %s")
+        values.append(start)
+
+    if end:
+        conditions.append("created_at <= %s")
+        values.append(end)
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY created_at DESC LIMIT 50"
+
+    cursor.execute(query, values)
 
     rows = cursor.fetchall()
 
