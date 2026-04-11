@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
@@ -115,26 +115,6 @@ def log_trade(pair, action, price, pnl, reason):
     cursor.close()
     conn.close()
 
-# ================================
-# OKX AUTH
-# ================================
-def sign(message, secret):
-    return base64.b64encode(
-        hmac.new(secret.encode(), message.encode(), digestmod="sha256").digest()
-    ).decode()
-
-def get_headers(method, endpoint, body=""):
-    timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-    message = timestamp + method + endpoint + body
-    signature = sign(message, OKX_SECRET_KEY)
-
-    return {
-        "OK-ACCESS-KEY": OKX_API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
-        "Content-Type": "application/json"
-
 def get_total_pnl():
     try:
         conn = get_db_connection()
@@ -156,13 +136,25 @@ def get_total_pnl():
         logger.error(f"PNL calc error: {e}")
         return 0.0
 
+# ================================
+# OKX AUTH
+# ================================
+def sign(message, secret):
+    return base64.b64encode(
+        hmac.new(secret.encode(), message.encode(), digestmod="sha256").digest()
+    ).decode()
 
-@app.get("/dashboard")
-def dashboard():
+def get_headers(method, endpoint, body=""):
+    timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    message = timestamp + method + endpoint + body
+    signature = sign(message, OKX_SECRET_KEY)
+
     return {
-        "balance": get_balance("USDT"),
-        "pnl": get_total_pnl(),
-        "status": "ON" if bot_running else "OFF"
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
+        "Content-Type": "application/json"
     }
 
 # ================================
@@ -362,6 +354,7 @@ def controlled_loop():
 def dashboard():
     return {
         "balance": get_balance("USDT"),
+        "pnl": get_total_pnl(),
         "status": "ON" if bot_running else "OFF"
     }
 
@@ -383,8 +376,6 @@ def stop_bot():
     global bot_running
     bot_running = False
     return {"message": "stopped"}
-
-from fastapi import Query
 
 @app.get("/logs")
 def logs(start: str = Query(None), end: str = Query(None)):
@@ -413,7 +404,6 @@ def logs(start: str = Query(None), end: str = Query(None)):
     query += " ORDER BY created_at DESC LIMIT 50"
 
     cursor.execute(query, values)
-
     rows = cursor.fetchall()
 
     cursor.close()
