@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 import os
 import time
@@ -13,26 +14,32 @@ from datetime import datetime, timezone
 app = FastAPI()
 
 # ================================
-# 🧠 LOGGER PROFISSIONAL
+# 🔥 CORS
+# ================================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ================================
+# LOGGER
 # ================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-
 logger = logging.getLogger(__name__)
 
 OKX_BASE = "https://www.okx.com"
 
-# ================================
-# 🔐 ENV VARIABLES
-# ================================
 OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
 # ================================
-# ⚙️ CONFIG
+# CONFIG ORIGINAL
 # ================================
 PAIRS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT",
@@ -56,25 +63,24 @@ MIN_DELTA = 0.01
 positions = {}
 
 # ================================
-# 🗄️ DATABASE
+# BOT STATE
+# ================================
+bot_running = False
+bot_thread = None
+
+# ================================
+# DATABASE
 # ================================
 def get_db_connection():
-    try:
-        conn = psycopg2.connect(
-            host=os.getenv("PGHOST"),
-            database=os.getenv("PGDATABASE"),
-            user=os.getenv("PGUSER"),
-            password=os.getenv("PGPASSWORD"),
-            port=os.getenv("PGPORT")
-        )
-        logger.info("✅ Conectado ao PostgreSQL")
-        return conn
-    except Exception as e:
-        logger.error(f"❌ ERRO DB CONNECTION: {e}")
-        raise
+    return psycopg2.connect(
+        host=os.getenv("PGHOST"),
+        database=os.getenv("PGDATABASE"),
+        user=os.getenv("PGUSER"),
+        password=os.getenv("PGPASSWORD"),
+        port=os.getenv("PGPORT")
+    )
 
 def init_db():
-    logger.info("🚀 Inicializando banco...")
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -94,30 +100,23 @@ def init_db():
     cursor.close()
     conn.close()
 
-    logger.info("✅ Tabela pronta")
-
 def log_trade(pair, action, price, pnl, reason):
-    logger.info(f"📊 TRADE → {pair} | {action} | price={price} | pnl={pnl} | {reason}")
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+    logger.info(f"TRADE → {pair} {action} price={price} pnl={pnl} {reason}")
 
-        cursor.execute("""
-            INSERT INTO trades (pair, action, price, pnl, reason)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (pair, action, price, pnl, reason))
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-        conn.commit()
-        cursor.close()
-        conn.close()
+    cursor.execute("""
+        INSERT INTO trades (pair, action, price, pnl, reason)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (pair, action, price, pnl, reason))
 
-        logger.info("✅ Trade salvo no banco")
-
-    except Exception as e:
-        logger.error(f"❌ ERRO AO SALVAR TRADE: {e}")
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 # ================================
-# 🔐 OKX AUTH
+# OKX AUTH
 # ================================
 def sign(message, secret):
     return base64.b64encode(
@@ -138,28 +137,24 @@ def get_headers(method, endpoint, body=""):
     }
 
 # ================================
-# 💰 BALANCE
+# BALANCE
 # ================================
 def get_balance(asset):
     try:
         endpoint = "/api/v5/account/balance"
         url = OKX_BASE + endpoint
-
         headers = get_headers("GET", endpoint)
         res = requests.get(url, headers=headers).json()
 
         for acc in res["data"][0]["details"]:
             if acc["ccy"] == asset:
-                balance = float(acc["availBal"])
-                logger.info(f"💰 Balance {asset}: {balance}")
-                return balance
+                return float(acc["availBal"])
     except Exception as e:
-        logger.error(f"❌ ERRO BALANCE: {e}")
-
+        logger.error(f"Balance error: {e}")
     return 0
 
 # ================================
-# 🧠 ORDER SIZE
+# ORDER SIZE
 # ================================
 def calculate_order_size():
     balance = get_balance("USDT")
@@ -175,117 +170,86 @@ def calculate_order_size():
     if size > balance:
         size = balance * 0.99
 
-    logger.info(f"💰 ORDER SIZE: {size}")
     return round(size, 2)
 
 # ================================
-# 💰 ORDER
+# ORDER
 # ================================
 def place_order(side, price, pair):
-
-    logger.info(f"📤 ORDER → {side} {pair} @ {price}")
+    logger.info(f"ORDER → {side} {pair} @ {price}")
 
     if DRY_RUN:
-        logger.info("🧪 DRY RUN")
         return {"code": "0"}
 
-    try:
-        endpoint = "/api/v5/trade/order"
-        url = OKX_BASE + endpoint
+    endpoint = "/api/v5/trade/order"
+    url = OKX_BASE + endpoint
 
-        if side.lower() == "buy":
-            size = calculate_order_size()
+    if side == "buy":
+        size = calculate_order_size()
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "buy",
+            "ordType": "market",
+            "sz": str(size),
+            "tgtCcy": "quote_ccy"
+        }
+    else:
+        base_asset = pair.split("-")[0]
+        balance = get_balance(base_asset)
 
-            body = {
-                "instId": pair,
-                "tdMode": "cash",
-                "side": "buy",
-                "ordType": "market",
-                "sz": str(size),
-                "tgtCcy": "quote_ccy"
-            }
+        if balance <= 0:
+            return {"code": "1"}
 
-        else:
-            base_asset = pair.split("-")[0]
-            balance = get_balance(base_asset)
+        size = f"{balance * 0.995:.6f}"
 
-            if balance <= 0:
-                logger.warning("⚠️ Sem saldo pra vender")
-                return {"code": "1"}
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "market",
+            "sz": size
+        }
 
-            size = f"{balance * 0.995:.6f}"
+    body_str = json.dumps(body)
+    headers = get_headers("POST", endpoint, body_str)
 
-            body = {
-                "instId": pair,
-                "tdMode": "cash",
-                "side": "sell",
-                "ordType": "market",
-                "sz": size
-            }
-
-        body_str = json.dumps(body)
-        headers = get_headers("POST", endpoint, body_str)
-
-        response = requests.post(url, headers=headers, data=body_str)
-        res_json = response.json()
-
-        logger.info(f"📡 RESPONSE: {res_json}")
-
-        return res_json
-
-    except Exception as e:
-        logger.error(f"❌ ERRO ORDER: {e}")
-        return {"code": "1"}
+    response = requests.post(url, headers=headers, data=body_str)
+    return response.json()
 
 # ================================
-# 📊 MARKET
+# MARKET
 # ================================
 def get_candles(pair, timeframe="1m", limit=5):
-    try:
-        url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
-        res = requests.get(url).json()
+    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
+    res = requests.get(url).json()
 
-        candles = res["data"]
-        closes = [float(c[4]) for c in candles]
-        volumes = [float(c[5]) for c in candles]
+    candles = res["data"]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
 
-        logger.info(f"📈 {pair} candles OK")
-        return closes, volumes
-    except Exception as e:
-        logger.error(f"❌ ERRO CANDLES {pair}: {e}")
-        return None
+    return closes, volumes
 
 # ================================
-# 📈 TREND
+# TREND
 # ================================
 def get_trend(pair):
     data = get_candles(pair, "5m", 20)
-    if not data:
-        return "range"
-
-    closes, _ = data
-    closes = list(reversed(closes))
+    closes = list(reversed(data[0]))
 
     sma_short = sum(closes[-5:]) / 5
     sma_long = sum(closes) / 20
 
-    trend = "up" if sma_short > sma_long else "down"
-    logger.info(f"📊 Trend {pair}: {trend}")
-
-    return trend
+    return "up" if sma_short > sma_long else "down"
 
 # ================================
-# 🧠 MANAGE POSITIONS
+# MANAGE POSITIONS
 # ================================
 def manage_positions():
     global positions
 
     for pair in list(positions.keys()):
-        data = get_candles(pair)
-        if not data:
-            continue
-
-        closes, _ = data
+        closes, _ = get_candles(pair)
         current_price = closes[0]
 
         pos = positions[pair]
@@ -293,35 +257,29 @@ def manage_positions():
         max_price = pos.get("max_price", entry)
 
         if current_price > max_price:
-            max_price = current_price
-            pos["max_price"] = max_price
+            pos["max_price"] = current_price
 
         profit = (current_price - entry) / entry
 
-        logger.info(f"📊 {pair} | entry={entry} | current={current_price} | pnl={profit}")
-
         if current_price <= entry * (1 - STOP_LOSS):
-            logger.warning(f"🛑 STOP LOSS {pair}")
             order = place_order("sell", current_price, pair)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, "stop_loss")
                 del positions[pair]
 
-        elif current_price <= max_price * (1 - TRAILING_STOP):
-            logger.warning(f"📉 TRAILING STOP {pair}")
+        elif current_price <= pos["max_price"] * (1 - TRAILING_STOP):
             order = place_order("sell", current_price, pair)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, "trailing_stop")
                 del positions[pair]
 
 # ================================
-# 🧠 SCANNER
+# SCAN MARKET
 # ================================
 def scan_market():
     global positions
 
     for pair in PAIRS:
-
         if pair in positions:
             continue
 
@@ -329,11 +287,7 @@ def scan_market():
         if trend != "up":
             continue
 
-        data = get_candles(pair)
-        if not data:
-            continue
-
-        closes, volumes = data
+        closes, volumes = get_candles(pair)
 
         price = closes[0]
         prev_price = closes[1]
@@ -342,11 +296,7 @@ def scan_market():
         volume_boost = volumes[0] > volumes[1] * 1.1
         volatility = (max(closes) - min(closes)) / closes[-1]
 
-        logger.info(f"🔎 {pair} | delta={delta} | vol={volume_boost} | volat={volatility}")
-
         if delta >= MIN_DELTA and volume_boost and volatility > 0.004:
-            logger.info(f"🟢 COMPRA {pair}")
-
             order = place_order("buy", price, pair)
 
             if order.get("code") == "0":
@@ -358,28 +308,83 @@ def scan_market():
                 log_trade(pair, "BUY", price, 0, "momentum")
 
 # ================================
-# LOOP
+# LOOP CONTROLADO
 # ================================
-def trading_loop():
-    logger.info("🚀 BOT INICIADO")
+def controlled_loop():
+    global bot_running
 
-    while True:
+    logger.info("BOT STARTED")
+
+    while bot_running:
         try:
             manage_positions()
             scan_market()
         except Exception as e:
-            logger.error(f"💥 LOOP ERROR: {e}")
+            logger.error(f"Loop error: {e}")
 
         time.sleep(15)
 
-# ================================
-# START
-# ================================
-@app.on_event("startup")
-def start_bot():
-    logger.info("🔥 STARTUP")
+    logger.info("BOT STOPPED")
 
+# ================================
+# API
+# ================================
+@app.get("/dashboard")
+def dashboard():
+    return {
+        "balance": get_balance("USDT"),
+        "status": "ON" if bot_running else "OFF"
+    }
+
+@app.post("/bot/start")
+def start_bot():
+    global bot_running, bot_thread
+
+    if bot_running:
+        return {"message": "already running"}
+
+    bot_running = True
+    bot_thread = threading.Thread(target=controlled_loop, daemon=True)
+    bot_thread.start()
+
+    return {"message": "started"}
+
+@app.post("/bot/stop")
+def stop_bot():
+    global bot_running
+    bot_running = False
+    return {"message": "stopped"}
+
+@app.get("/logs")
+def logs():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT pair, action, price, pnl, reason, created_at
+        FROM trades
+        ORDER BY created_at DESC
+        LIMIT 20
+    """)
+
+    rows = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return [
+        {
+            "pair": r[0],
+            "action": r[1],
+            "price": float(r[2]),
+            "pnl": float(r[3]),
+            "reason": r[4],
+            "time": r[5].isoformat()
+        }
+        for r in rows
+    ]
+
+@app.on_event("startup")
+def startup():
     init_db()
 
-    thread = threading.Thread(target=trading_loop, daemon=True)
-    thread.start()
