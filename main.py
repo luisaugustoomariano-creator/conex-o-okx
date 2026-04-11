@@ -10,12 +10,13 @@ import json
 import psycopg2
 import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-app = FastAPI()
+app = FastAPI(title="Jarvis Cripto Bot API", version="2.1.0")
 
-# ================================
+# ====
 # 🔥 CORS
-# ================================
+# ====
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,9 +24,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================================
+# ====
 # LOGGER
-# ================================
+# ====
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
@@ -38,9 +39,9 @@ OKX_API_KEY = os.getenv("OKX_API_KEY")
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY")
 OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE")
 
-# ================================
-# CONFIG
-# ================================
+# ====
+# CONFIG BASE
+# ====
 PAIRS = [
     "BTC-USDT", "ETH-USDT", "SOL-USDT",
     "XRP-USDT", "DOGE-USDT", "AVAX-USDT",
@@ -54,32 +55,131 @@ PAIRS = [
 
 DRY_RUN = False
 MIN_ORDER_USDT = 20
-RISK_PER_TRADE = 0.04
 
-# Estratégia ajustada (mais oportunidades, mas com filtros de qualidade)
-STOP_LOSS = 0.012              # 1.2%
-TRAILING_STOP = 0.025          # 2.5%
-MIN_DELTA = 0.0075             # 0.75%
-MIN_VOLATILITY = 0.006         # 0.6%
-MAX_VOLATILITY = 0.03          # 3.0%
-VOLUME_MULTIPLIER = 1.25
-BREAKOUT_LOOKBACK = 10
-MAX_OPEN_POSITIONS = 3
-COOLDOWN_MINUTES = 25
-BREAKEVEN_TRIGGER = 0.01       # 1.0%
+DEFAULT_RISK_MODE = "medium"
+RISK_MODES = {"low", "medium", "high"}
 
-positions = {}
-last_exit_times = {}
+RISK_PROFILES: Dict[str, Dict[str, float]] = {
+    # Mais conservador: menos entradas, maior confirmação, menor risco por posição
+    "low": {
+        "risk_per_trade": 0.02,
+        "stop_loss": 0.009,
+        "trailing_stop": 0.024,
+        "min_delta": 0.012,
+        "volume_multiplier": 1.25,
+        "min_volatility": 0.0055,
+        "max_volatility": 0.060,
+        "trend_fast": 5,
+        "trend_slow": 24,
+        "min_trend_gap": 0.0015,
+        "confirmation_window": 4,
+        "required_green_candles": 3,
+    },
+    # Estratégia atual (balanceada)
+    "medium": {
+        "risk_per_trade": 0.04,
+        "stop_loss": 0.010,
+        "trailing_stop": 0.030,
+        "min_delta": 0.010,
+        "volume_multiplier": 1.10,
+        "min_volatility": 0.0040,
+        "max_volatility": 0.075,
+        "trend_fast": 5,
+        "trend_slow": 20,
+        "min_trend_gap": 0.0008,
+        "confirmation_window": 3,
+        "required_green_candles": 2,
+    },
+    # Mais agressivo, mas ainda com filtros de qualidade (trend + momentum + volume + volatilidade controlada)
+    "high": {
+        "risk_per_trade": 0.06,
+        "stop_loss": 0.013,
+        "trailing_stop": 0.038,
+        "min_delta": 0.007,
+        "volume_multiplier": 1.03,
+        "min_volatility": 0.0030,
+        "max_volatility": 0.095,
+        "trend_fast": 4,
+        "trend_slow": 18,
+        "min_trend_gap": 0.0003,
+        "confirmation_window": 3,
+        "required_green_candles": 2,
+    },
+}
 
-# ================================
+positions: Dict[str, Dict[str, float]] = {}
+
+# ====
 # BOT STATE
-# ================================
+# ====
 bot_running = False
-bot_thread = None
+bot_thread: Optional[threading.Thread] = None
+active_risk_mode = DEFAULT_RISK_MODE
+state_lock = threading.Lock()
 
-# ================================
+
+# ====
+# HELPERS DE RESPOSTA (PADRÃO JSON)
+# ====
+def api_success(data: Any = None, message: str = "ok") -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+def api_error(message: str, data: Any = None) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "message": message,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "data": data,
+    }
+
+
+# ====
+# RISK MODE
+# ====
+def normalize_risk_mode(risk_mode: Optional[str]) -> str:
+    mode = (risk_mode or DEFAULT_RISK_MODE).strip().lower()
+    if mode not in RISK_MODES:
+        raise ValueError(f"risk_mode inválido: {risk_mode}. Use low, medium ou high")
+    return mode
+
+
+def get_active_risk_mode() -> str:
+    with state_lock:
+        return active_risk_mode
+
+
+def get_risk_profile(risk_mode: Optional[str] = None) -> Dict[str, float]:
+    mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
+    return RISK_PROFILES[mode]
+
+
+def set_active_risk_mode(risk_mode: str) -> str:
+    global active_risk_mode
+    mode = normalize_risk_mode(risk_mode)
+    with state_lock:
+        active_risk_mode = mode
+    logger.info(f"RISK MODE alterado para {mode}")
+    return mode
+
+
+def get_risk_mode_payload() -> Dict[str, Any]:
+    current = get_active_risk_mode()
+    return {
+        "risk_mode": current,
+        "available_modes": sorted(list(RISK_MODES)),
+        "profile": RISK_PROFILES[current],
+    }
+
+
+# ====
 # DATABASE
-# ================================
+# ====
 def get_db_connection():
     return psycopg2.connect(
         host=os.getenv("PGHOST"),
@@ -88,6 +188,7 @@ def get_db_connection():
         password=os.getenv("PGPASSWORD"),
         port=os.getenv("PGPORT")
     )
+
 
 def init_db():
     conn = get_db_connection()
@@ -105,39 +206,325 @@ def init_db():
         )
     """)
 
-    # Índices simples para consultas mais rápidas
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades(created_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_action ON trades(action)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_created_at ON trades (created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades (pair)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_action ON trades (action)")
 
     conn.commit()
     cursor.close()
     conn.close()
 
-def log_trade(pair, action, price, pnl, reason):
-    logger.info(f"TRADE → {pair} {action} price={price} pnl={pnl} {reason}")
+
+def log_trade(pair: str, action: str, price: float, pnl: float, reason: str):
+    logger.info(f"TRADE → {pair} {action} price={price} pnl={pnl} reason={reason}")
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT INTO trades (pair, action, price, pnl, reason)
         VALUES (%s, %s, %s, %s, %s)
-    """, (pair, action, price, pnl, reason))
+        """,
+        (pair, action, price, pnl, reason)
+    )
 
     conn.commit()
     cursor.close()
     conn.close()
 
-def get_total_pnl():
+
+# ====
+# OKX AUTH
+# ====
+def sign(message: str, secret: str) -> str:
+    return base64.b64encode(
+        hmac.new(secret.encode(), message.encode(), digestmod="sha256").digest()
+    ).decode()
+
+
+def get_headers(method: str, endpoint: str, body: str = "") -> Dict[str, str]:
+    if not OKX_API_KEY or not OKX_SECRET_KEY or not OKX_PASSPHRASE:
+        raise RuntimeError("Credenciais da OKX não configuradas no ambiente")
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    message = timestamp + method + endpoint + body
+    signature = sign(message, OKX_SECRET_KEY)
+
+    return {
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
+        "Content-Type": "application/json",
+    }
+
+
+# ====
+# BALANCE
+# ====
+def get_balance(asset: str) -> float:
+    try:
+        endpoint = "/api/v5/account/balance"
+        url = OKX_BASE + endpoint
+        headers = get_headers("GET", endpoint)
+        res = requests.get(url, headers=headers, timeout=20).json()
+
+        for acc in res.get("data", [{}])[0].get("details", []):
+            if acc.get("ccy") == asset:
+                return float(acc.get("availBal", 0) or 0)
+    except Exception as e:
+        logger.error(f"Balance error ({asset}): {e}")
+
+    return 0.0
+
+
+# ====
+# ORDER SIZE
+# ====
+def calculate_order_size(risk_mode: Optional[str] = None) -> float:
+    profile = get_risk_profile(risk_mode)
+    balance = get_balance("USDT")
+
+    if balance <= 0:
+        return 0
+
+    size = balance * profile["risk_per_trade"]
+
+    if size < MIN_ORDER_USDT:
+        size = MIN_ORDER_USDT
+
+    if size > balance:
+        size = balance * 0.99
+
+    return round(size, 2)
+
+
+# ====
+# ORDER
+# ====
+def place_order(side: str, price: float, pair: str, risk_mode: Optional[str] = None) -> Dict[str, Any]:
+    mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
+    logger.info(f"ORDER → {side.upper()} {pair} @ {price} (risk_mode={mode})")
+
+    if DRY_RUN:
+        return {"code": "0", "msg": "dry_run"}
+
+    endpoint = "/api/v5/trade/order"
+    url = OKX_BASE + endpoint
+
+    if side == "buy":
+        size = calculate_order_size(mode)
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "buy",
+            "ordType": "market",
+            "sz": str(size),
+            "tgtCcy": "quote_ccy",
+        }
+    else:
+        base_asset = pair.split("-")[0]
+        balance = get_balance(base_asset)
+
+        if balance <= 0:
+            return {"code": "1", "msg": "saldo insuficiente para venda"}
+
+        size = f"{balance * 0.995:.6f}"
+
+        body = {
+            "instId": pair,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "market",
+            "sz": size,
+        }
+
+    body_str = json.dumps(body)
+    headers = get_headers("POST", endpoint, body_str)
+
+    response = requests.post(url, headers=headers, data=body_str, timeout=20)
+    return response.json()
+
+
+# ====
+# MARKET
+# ====
+def get_candles(pair: str, timeframe: str = "1m", limit: int = 6) -> Tuple[List[float], List[float]]:
+    url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
+    res = requests.get(url, timeout=20).json()
+
+    candles = res.get("data", [])
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+
+    return closes, volumes
+
+
+# ====
+# TREND
+# ====
+def get_trend(pair: str, fast: int, slow: int) -> Dict[str, float]:
+    closes, _ = get_candles(pair, "5m", slow)
+
+    if len(closes) < slow:
+        return {"is_up": False, "gap": 0.0}
+
+    closes = list(reversed(closes))
+
+    sma_short = sum(closes[-fast:]) / fast
+    sma_long = sum(closes[-slow:]) / slow
+
+    gap = (sma_short - sma_long) / sma_long if sma_long else 0.0
+    return {"is_up": sma_short > sma_long, "gap": gap}
+
+
+def count_green_candles(closes: List[float], window: int) -> int:
+    if len(closes) < window + 1:
+        return 0
+
+    recent_chronological = list(reversed(closes[: window + 1]))
+    greens = 0
+
+    for idx in range(1, len(recent_chronological)):
+        if recent_chronological[idx] > recent_chronological[idx - 1]:
+            greens += 1
+
+    return greens
+
+
+# ====
+# MANAGE POSITIONS
+# ====
+def manage_positions(risk_mode: Optional[str] = None):
+    global positions
+
+    profile = get_risk_profile(risk_mode)
+    stop_loss = profile["stop_loss"]
+    trailing_stop = profile["trailing_stop"]
+
+    for pair in list(positions.keys()):
+        closes, _ = get_candles(pair)
+        if not closes:
+            continue
+
+        current_price = closes[0]
+        pos = positions[pair]
+        entry = pos["entry_price"]
+        max_price = pos.get("max_price", entry)
+
+        if current_price > max_price:
+            pos["max_price"] = current_price
+
+        profit = (current_price - entry) / entry
+
+        if current_price <= entry * (1 - stop_loss):
+            order = place_order("sell", current_price, pair, risk_mode)
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, profit, f"stop_loss_{get_active_risk_mode()}")
+                del positions[pair]
+
+        elif current_price <= pos["max_price"] * (1 - trailing_stop):
+            order = place_order("sell", current_price, pair, risk_mode)
+            if order.get("code") == "0":
+                log_trade(pair, "SELL", current_price, profit, f"trailing_stop_{get_active_risk_mode()}")
+                del positions[pair]
+
+
+# ====
+# SCAN MARKET
+# ====
+def scan_market(risk_mode: Optional[str] = None):
+    global positions
+
+    mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
+    profile = get_risk_profile(mode)
+
+    confirmation_window = int(profile["confirmation_window"])
+    required_green_candles = int(profile["required_green_candles"])
+
+    for pair in PAIRS:
+        if pair in positions:
+            continue
+
+        trend_data = get_trend(
+            pair,
+            int(profile["trend_fast"]),
+            int(profile["trend_slow"]),
+        )
+
+        if not trend_data["is_up"] or trend_data["gap"] < profile["min_trend_gap"]:
+            continue
+
+        candle_limit = max(confirmation_window + 2, 6)
+        closes, volumes = get_candles(pair, "1m", candle_limit)
+        if len(closes) < candle_limit or len(volumes) < candle_limit:
+            continue
+
+        price = closes[0]
+        prev_price = closes[1]
+
+        delta = (price - prev_price) / prev_price if prev_price else 0.0
+        volume_reference = sum(volumes[1:]) / (len(volumes) - 1)
+        volume_boost = volumes[0] >= (volume_reference * profile["volume_multiplier"])
+        volatility = (max(closes) - min(closes)) / price if price else 0.0
+        green_candles = count_green_candles(closes, confirmation_window)
+
+        quality_filters_ok = (
+            delta >= profile["min_delta"]
+            and volume_boost
+            and profile["min_volatility"] <= volatility <= profile["max_volatility"]
+            and green_candles >= required_green_candles
+        )
+
+        if not quality_filters_ok:
+            continue
+
+        order = place_order("buy", price, pair, mode)
+
+        if order.get("code") == "0":
+            positions[pair] = {
+                "entry_price": price,
+                "max_price": price,
+            }
+            log_trade(pair, "BUY", price, 0, f"momentum_{mode}")
+
+
+# ====
+# LOOP CONTROLADO
+# ====
+def controlled_loop():
+    global bot_running
+    logger.info("BOT STARTED")
+
+    while bot_running:
+        try:
+            mode = get_active_risk_mode()
+            manage_positions(mode)
+            scan_market(mode)
+        except Exception as e:
+            logger.error(f"Loop error: {e}")
+
+        time.sleep(15)
+
+    logger.info("BOT STOPPED")
+
+
+# ====
+# MÉTRICAS
+# ====
+def get_total_pnl() -> float:
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT COALESCE(SUM(pnl), 0)
             FROM trades
             WHERE action = 'SELL'
-        """)
+            """
+        )
 
         total = cursor.fetchone()[0] or 0
 
@@ -149,331 +536,197 @@ def get_total_pnl():
         logger.error(f"PNL calc error: {e}")
         return 0.0
 
-# ================================
-# OKX AUTH
-# ================================
-def sign(message, secret):
-    return base64.b64encode(
-        hmac.new(secret.encode(), message.encode(), digestmod="sha256").digest()
-    ).decode()
 
-def get_headers(method, endpoint, body=""):
-    timestamp = datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-    message = timestamp + method + endpoint + body
-    signature = sign(message, OKX_SECRET_KEY)
+def get_trade_stats() -> Dict[str, Any]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS total_trades,
+            COUNT(*) FILTER (WHERE action = 'BUY') AS total_buys,
+            COUNT(*) FILTER (WHERE action = 'SELL') AS total_sells,
+            COUNT(*) FILTER (WHERE action = 'SELL' AND pnl > 0) AS winning_trades,
+            COUNT(*) FILTER (WHERE action = 'SELL' AND pnl < 0) AS losing_trades,
+            COALESCE(SUM(pnl) FILTER (WHERE action = 'SELL'), 0) AS total_pnl,
+            COALESCE(AVG(pnl) FILTER (WHERE action = 'SELL'), 0) AS avg_pnl
+        FROM trades
+        """
+    )
+
+    row = cursor.fetchone()
+
+    cursor.execute(
+        """
+        SELECT pair, pnl, created_at
+        FROM trades
+        WHERE action = 'SELL'
+        ORDER BY pnl DESC
+        LIMIT 1
+        """
+    )
+    best = cursor.fetchone()
+
+    cursor.execute(
+        """
+        SELECT pair, pnl, created_at
+        FROM trades
+        WHERE action = 'SELL'
+        ORDER BY pnl ASC
+        LIMIT 1
+        """
+    )
+    worst = cursor.fetchone()
+
+    cursor.close()
+    conn.close()
+
+    total_sells = int(row[2] or 0)
+    winning = int(row[3] or 0)
+    win_rate = (winning / total_sells * 100) if total_sells > 0 else 0.0
 
     return {
-        "OK-ACCESS-KEY": OKX_API_KEY,
-        "OK-ACCESS-SIGN": signature,
-        "OK-ACCESS-TIMESTAMP": timestamp,
-        "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
-        "Content-Type": "application/json"
+        "total_trades": int(row[0] or 0),
+        "total_buys": int(row[1] or 0),
+        "total_sells": total_sells,
+        "winning_trades": winning,
+        "losing_trades": int(row[4] or 0),
+        "win_rate": round(win_rate, 2),
+        "total_pnl": float(row[5] or 0),
+        "avg_pnl": float(row[6] or 0),
+        "best_trade": {
+            "pair": best[0],
+            "pnl": float(best[1]),
+            "time": best[2].isoformat(),
+        } if best else None,
+        "worst_trade": {
+            "pair": worst[0],
+            "pnl": float(worst[1]),
+            "time": worst[2].isoformat(),
+        } if worst else None,
     }
 
-# ================================
-# BALANCE
-# ================================
-def get_balance(asset):
-    try:
-        endpoint = "/api/v5/account/balance"
-        url = OKX_BASE + endpoint
-        headers = get_headers("GET", endpoint)
-        res = requests.get(url, headers=headers, timeout=10).json()
 
-        for acc in res.get("data", [{}])[0].get("details", []):
-            if acc.get("ccy") == asset:
-                return float(acc.get("availBal", 0))
-    except Exception as e:
-        logger.error(f"Balance error: {e}")
-    return 0.0
+def get_pnl_history(interval: str = "day", limit: int = 50) -> List[Dict[str, Any]]:
+    if interval not in {"hour", "day"}:
+        interval = "day"
 
-# ================================
-# ORDER SIZE
-# ================================
-def calculate_order_size():
-    balance = get_balance("USDT")
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    if balance <= 0:
-        return 0
+    cursor.execute(
+        f"""
+        SELECT
+            date_trunc('{interval}', created_at) AS bucket,
+            COALESCE(SUM(pnl) FILTER (WHERE action = 'SELL'), 0) AS pnl_periodo,
+            COALESCE(SUM(SUM(pnl) FILTER (WHERE action = 'SELL'))
+                OVER (ORDER BY date_trunc('{interval}', created_at)), 0) AS pnl_acumulado
+        FROM trades
+        GROUP BY 1
+        ORDER BY bucket DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
 
-    size = balance * RISK_PER_TRADE
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
 
-    if size < MIN_ORDER_USDT:
-        size = MIN_ORDER_USDT
+    rows.reverse()
 
-    if size > balance:
-        size = balance * 0.99
-
-    return round(size, 2)
-
-# ================================
-# ORDER
-# ================================
-def place_order(side, price, pair):
-    logger.info(f"ORDER → {side.upper()} {pair} @ {price}")
-
-    if DRY_RUN:
-        return {"code": "0"}
-
-    endpoint = "/api/v5/trade/order"
-    url = OKX_BASE + endpoint
-
-    if side == "buy":
-        size = calculate_order_size()
-        if size <= 0:
-            return {"code": "1", "msg": "invalid size"}
-        body = {
-            "instId": pair,
-            "tdMode": "cash",
-            "side": "buy",
-            "ordType": "market",
-            "sz": str(size),
-            "tgtCcy": "quote_ccy"
+    return [
+        {
+            "time": r[0].isoformat(),
+            "pnl_period": float(r[1] or 0),
+            "pnl_cumulative": float(r[2] or 0),
         }
-    else:
-        base_asset = pair.split("-")[0]
-        balance = get_balance(base_asset)
+        for r in rows
+    ]
 
-        if balance <= 0:
-            return {"code": "1", "msg": "no base balance to sell"}
 
-        size = f"{balance * 0.995:.6f}"
-        body = {
-            "instId": pair,
-            "tdMode": "cash",
-            "side": "sell",
-            "ordType": "market",
-            "sz": size
-        }
-
-    body_str = json.dumps(body)
-    headers = get_headers("POST", endpoint, body_str)
-
-    try:
-        response = requests.post(url, headers=headers, data=body_str, timeout=10)
-        return response.json()
-    except Exception as e:
-        logger.error(f"Order error: {e}")
-        return {"code": "1", "msg": str(e)}
-
-# ================================
-# MARKET
-# ================================
-def get_candles(pair, timeframe="1m", limit=30):
-    try:
-        url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
-        res = requests.get(url, timeout=10).json()
-        candles = res.get("data", [])
-
-        if not candles:
-            return [], []
-
-        closes = [float(c[4]) for c in candles]
-        volumes = [float(c[5]) for c in candles]
-        return closes, volumes
-    except Exception as e:
-        logger.error(f"Candles error {pair} {timeframe}: {e}")
-        return [], []
-
-# ================================
-# TREND HELPERS
-# ================================
-def sma(values, n):
-    if len(values) < n:
-        return None
-    return sum(values[-n:]) / n
-
-def get_trend(pair, timeframe="5m"):
-    closes, _ = get_candles(pair, timeframe=timeframe, limit=20)
-    if len(closes) < 20:
-        return "down"
-
-    closes = list(reversed(closes))  # antigo -> novo
-    sma_short = sma(closes, 5)
-    sma_long = sma(closes, 20)
-
-    if sma_short is None or sma_long is None:
-        return "down"
-
-    return "up" if sma_short > sma_long else "down"
-
-def get_trend_multi_tf(pair):
-    trend_5m = get_trend(pair, "5m")
-    trend_15m = get_trend(pair, "15m")
-    return trend_5m == "up" and trend_15m == "up"
-
-def in_cooldown(pair):
-    last_exit = last_exit_times.get(pair)
-    if not last_exit:
-        return False
-    return (time.time() - last_exit) < (COOLDOWN_MINUTES * 60)
-
-# ================================
-# MANAGE POSITIONS
-# ================================
-def manage_positions():
-    global positions, last_exit_times
-
-    for pair in list(positions.keys()):
-        closes, _ = get_candles(pair, limit=5)
-        if not closes:
-            continue
-
-        current_price = closes[0]
-        pos = positions[pair]
-        entry = pos["entry_price"]
-        max_price = pos.get("max_price", entry)
-
-        if current_price > max_price:
-            pos["max_price"] = current_price
-            max_price = current_price
-
-        profit = (current_price - entry) / entry
-
-        # Arma breakeven quando bater alvo mínimo de lucro
-        if (not pos.get("breakeven_armed")) and profit >= BREAKEVEN_TRIGGER:
-            pos["breakeven_armed"] = True
-            pos["stop_price"] = entry
-            logger.info(f"{pair} breakeven armed at entry={entry}")
-
-        base_stop = entry * (1 - STOP_LOSS)
-        dynamic_stop = max(base_stop, pos.get("stop_price", 0))
-
-        # Stop (normal ou breakeven)
-        if current_price <= dynamic_stop:
-            order = place_order("sell", current_price, pair)
-            if order.get("code") == "0":
-                reason = "breakeven" if pos.get("breakeven_armed") and current_price >= entry * 0.999 else "stop_loss"
-                log_trade(pair, "SELL", current_price, profit, reason)
-                del positions[pair]
-                last_exit_times[pair] = time.time()
-            continue
-
-        # Trailing stop
-        trailing_line = max_price * (1 - TRAILING_STOP)
-        if current_price <= trailing_line:
-            order = place_order("sell", current_price, pair)
-            if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, profit, "trailing_stop")
-                del positions[pair]
-                last_exit_times[pair] = time.time()
-
-# ================================
-# SCAN MARKET
-# ================================
-def scan_market():
-    global positions
-
-    # Limite global de posições
-    if len(positions) >= MAX_OPEN_POSITIONS:
-        return
-
-    for pair in PAIRS:
-        if len(positions) >= MAX_OPEN_POSITIONS:
-            break
-
-        if pair in positions:
-            continue
-
-        if in_cooldown(pair):
-            continue
-
-        # Tendência alinhada em 5m e 15m
-        if not get_trend_multi_tf(pair):
-            continue
-
-        closes, volumes = get_candles(pair, timeframe="1m", limit=max(30, BREAKOUT_LOOKBACK + 5))
-        if len(closes) < BREAKOUT_LOOKBACK + 2 or len(volumes) < BREAKOUT_LOOKBACK + 2:
-            continue
-
-        price = closes[0]
-        prev_price = closes[1]
-        delta = (price - prev_price) / prev_price if prev_price > 0 else 0
-
-        # Breakout: preço atual acima da máxima recente (sem contar candle atual)
-        recent_high = max(closes[1:BREAKOUT_LOOKBACK + 1])
-        is_breakout = price > recent_high
-
-        # Volume forte
-        vol_avg = sum(volumes[1:BREAKOUT_LOOKBACK + 1]) / BREAKOUT_LOOKBACK
-        volume_boost = volumes[0] > (vol_avg * VOLUME_MULTIPLIER)
-
-        # Volatilidade em faixa saudável
-        local_high = max(closes[:BREAKOUT_LOOKBACK + 1])
-        local_low = min(closes[:BREAKOUT_LOOKBACK + 1])
-        volatility = (local_high - local_low) / price if price > 0 else 0
-        volatility_ok = MIN_VOLATILITY <= volatility <= MAX_VOLATILITY
-
-        should_buy = (
-            delta >= MIN_DELTA
-            and is_breakout
-            and volume_boost
-            and volatility_ok
-        )
-
-        if should_buy:
-            order = place_order("buy", price, pair)
-            if order.get("code") == "0":
-                positions[pair] = {
-                    "entry_price": price,
-                    "max_price": price,
-                    "breakeven_armed": False,
-                    "stop_price": 0.0
-                }
-                log_trade(pair, "BUY", price, 0, "breakout_momentum")
-
-# ================================
-# LOOP CONTROLADO
-# ================================
-def controlled_loop():
-    global bot_running
-
-    logger.info("BOT STARTED")
-
-    while bot_running:
-        try:
-            manage_positions()
-            scan_market()
-        except Exception as e:
-            logger.error(f"Loop error: {e}")
-
-        time.sleep(15)
-
-    logger.info("BOT STOPPED")
-
-# ================================
+# ====
 # API
-# ================================
+# ====
+@app.get("/health")
+def health():
+    return api_success({"service": "jarvis-cripto-backend", "status": "online"})
+
+
 @app.get("/dashboard")
 def dashboard():
-    return {
+    mode = get_active_risk_mode()
+    profile = get_risk_profile(mode)
+
+    data = {
         "balance": get_balance("USDT"),
         "pnl": get_total_pnl(),
         "status": "ON" if bot_running else "OFF",
-        "open_positions": len(positions)
+        "open_positions": len(positions),
+        "risk_mode": mode,
+        "risk_per_trade": profile["risk_per_trade"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    return api_success(data)
+
+
+@app.get("/bot/risk-mode")
+def get_bot_risk_mode():
+    return api_success(get_risk_mode_payload())
+
+
+@app.post("/bot/risk-mode")
+def update_bot_risk_mode(
+    risk_mode: str = Query(..., pattern="^(low|medium|high)$")
+):
+    try:
+        mode = set_active_risk_mode(risk_mode)
+        return api_success(get_risk_mode_payload(), f"Jarvis: modo de risco atualizado para {mode}")
+    except ValueError as e:
+        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
+
 
 @app.post("/bot/start")
-def start_bot():
+def start_bot(
+    risk_mode: str = Query(default=DEFAULT_RISK_MODE, pattern="^(low|medium|high)$")
+):
     global bot_running, bot_thread
 
+    try:
+        mode = set_active_risk_mode(risk_mode)
+    except ValueError as e:
+        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
+
     if bot_running:
-        return {"message": "already running"}
+        return api_success(
+            {"status": "ON", "risk_mode": mode},
+            "Jarvis: bot já estava em execução (modo de risco atualizado)"
+        )
 
     bot_running = True
     bot_thread = threading.Thread(target=controlled_loop, daemon=True)
     bot_thread.start()
 
-    return {"message": "started"}
+    return api_success({"status": "ON", "risk_mode": mode}, "Jarvis: bot iniciado com sucesso")
+
 
 @app.post("/bot/stop")
 def stop_bot():
     global bot_running
     bot_running = False
-    return {"message": "stopped"}
+    return api_success({"status": "OFF", "risk_mode": get_active_risk_mode()}, "Jarvis: bot parado")
+
 
 @app.get("/logs")
-def logs(start: str = Query(None), end: str = Query(None)):
+def logs(
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    pair: Optional[str] = Query(default=None),
+    action: Optional[str] = Query(default=None),
+    reason: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=50),
+):
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -483,7 +736,7 @@ def logs(start: str = Query(None), end: str = Query(None)):
     """
 
     conditions = []
-    values = []
+    values: List[Any] = []
 
     if start:
         conditions.append("created_at >= %s")
@@ -493,10 +746,23 @@ def logs(start: str = Query(None), end: str = Query(None)):
         conditions.append("created_at <= %s")
         values.append(end)
 
+    if pair:
+        conditions.append("pair = %s")
+        values.append(pair)
+
+    if action:
+        conditions.append("action = %s")
+        values.append(action.upper())
+
+    if reason:
+        conditions.append("reason ILIKE %s")
+        values.append(f"%{reason}%")
+
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
 
-    query += " ORDER BY created_at DESC LIMIT 100"
+    query += " ORDER BY created_at DESC LIMIT %s"
+    values.append(limit)
 
     cursor.execute(query, values)
     rows = cursor.fetchall()
@@ -504,18 +770,49 @@ def logs(start: str = Query(None), end: str = Query(None)):
     cursor.close()
     conn.close()
 
-    return [
+    payload = [
         {
             "pair": r[0],
             "action": r[1],
             "price": float(r[2]),
             "pnl": float(r[3]),
             "reason": r[4],
-            "time": r[5].isoformat()
+            "time": r[5].isoformat(),
         }
         for r in rows
     ]
 
+    return api_success({"items": payload, "count": len(payload), "limit": limit})
+
+
+@app.get("/stats/summary")
+def stats_summary():
+    try:
+        stats = get_trade_stats()
+        stats["bot_status"] = "ON" if bot_running else "OFF"
+        stats["open_positions"] = len(positions)
+        stats["risk_mode"] = get_active_risk_mode()
+        stats["risk_profile"] = get_risk_profile()
+        return api_success(stats)
+    except Exception as e:
+        logger.error(f"stats_summary error: {e}")
+        return api_error("Jarvis: erro ao calcular estatísticas", {"detail": str(e)})
+
+
+@app.get("/stats/pnl-history")
+def stats_pnl_history(
+    interval: str = Query(default="day", pattern="^(hour|day)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    try:
+        history = get_pnl_history(interval=interval, limit=limit)
+        return api_success({"interval": interval, "items": history, "count": len(history), "risk_mode": get_active_risk_mode()})
+    except Exception as e:
+        logger.error(f"stats_pnl_history error: {e}")
+        return api_error("Jarvis: erro ao carregar histórico de PNL", {"detail": str(e)})
+
+
 @app.on_event("startup")
 def startup():
     init_db()
+    logger.info("Jarvis backend inicializado com sucesso")
