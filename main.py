@@ -134,6 +134,35 @@ def get_headers(method, endpoint, body=""):
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
         "Content-Type": "application/json"
+
+def get_total_pnl():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT COALESCE(SUM(pnl), 0)
+            FROM trades
+            WHERE action = 'SELL'
+        """)
+
+        total = cursor.fetchone()[0] or 0
+
+        cursor.close()
+        conn.close()
+
+        return float(total)
+    except Exception as e:
+        logger.error(f"PNL calc error: {e}")
+        return 0.0
+
+
+@app.get("/dashboard")
+def dashboard():
+    return {
+        "balance": get_balance("USDT"),
+        "pnl": get_total_pnl(),
+        "status": "ON" if bot_running else "OFF"
     }
 
 # ================================
