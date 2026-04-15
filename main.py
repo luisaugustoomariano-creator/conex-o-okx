@@ -58,40 +58,37 @@ MIN_ORDER_USDT = 20
 ENTRY_LIMIT_OFFSET = 0.001
 ENTRY_LIMIT_TIMEOUT_SECONDS = 10
 ENTRY_LIMIT_POLL_INTERVAL_SECONDS = 1
-TOTAL_TRADE_FEE_RATE = 0.008
-TRAILING_ACTIVATION_PROFIT = 0.01
-SMART_TRAILING_MULTIPLIER = 0.995
+TAKE_PROFIT_RATE = 0.018
+DEFAULT_MARKET_TIMEFRAME = "5m"
 
 DEFAULT_RISK_MODE = "medium"
 RISK_MODES = {"low", "medium", "high"}
 
 RISK_PROFILES: Dict[str, Dict[str, float]] = {
-    # Mais conservador: menos entradas, maior confirmaÃ§Ã£o, menor risco por posiÃ§Ã£o
+    # Mais conservador: menos entradas, maior confirmação, menor risco por posição
     "low": {
         "risk_per_trade": 0.02,
         "stop_loss": 0.009,
-        "trailing_stop": 0.024,
         "min_delta": 0.012,
         "volume_multiplier": 1.25,
         "min_volatility": 0.0055,
         "max_volatility": 0.060,
-        "trend_fast": 5,
-        "trend_slow": 24,
-        "min_trend_gap": 0.0015,
-        "confirmation_window": 4,
-        "required_green_candles": 3,
+        "trend_fast": 9,
+        "trend_slow": 21,
+        "min_trend_gap": 0.0,
+        "confirmation_window": 2,
+        "required_green_candles": 1,
     },
-    # EstratÃ©gia atual (balanceada)
+    # Estratégia atual (balanceada)
     "medium": {
         "risk_per_trade": 0.04,
         "stop_loss": 0.010,
-        "trailing_stop": 0.030,
         "min_delta": 0.010,
         "volume_multiplier": 1.10,
         "min_volatility": 0.0040,
         "max_volatility": 0.075,
-        "trend_fast": 5,
-        "trend_slow": 20,
+        "trend_fast": 9,
+        "trend_slow": 21,
         "min_trend_gap": 0.0008,
         "confirmation_window": 3,
         "required_green_candles": 2,
@@ -100,13 +97,12 @@ RISK_PROFILES: Dict[str, Dict[str, float]] = {
     "high": {
         "risk_per_trade": 0.06,
         "stop_loss": 0.013,
-        "trailing_stop": 0.038,
         "min_delta": 0.007,
         "volume_multiplier": 1.03,
         "min_volatility": 0.0030,
         "max_volatility": 0.095,
-        "trend_fast": 4,
-        "trend_slow": 18,
+        "trend_fast": 9,
+        "trend_slow": 21,
         "min_trend_gap": 0.0003,
         "confirmation_window": 3,
         "required_green_candles": 2,
@@ -125,7 +121,7 @@ state_lock = threading.Lock()
 
 
 # ====
-# HELPERS DE RESPOSTA (PADRÃƒO JSON)
+# HELPERS DE RESPOSTA (PADRÃO JSON)
 # ====
 def api_success(data: Any = None, message: str = "ok") -> Dict[str, Any]:
     return {
@@ -151,7 +147,7 @@ def api_error(message: str, data: Any = None) -> Dict[str, Any]:
 def normalize_risk_mode(risk_mode: Optional[str]) -> str:
     mode = (risk_mode or DEFAULT_RISK_MODE).strip().lower()
     if mode not in RISK_MODES:
-        raise ValueError(f"risk_mode invÃ¡lido: {risk_mode}. Use low, medium ou high")
+        raise ValueError(f"risk_mode inválido: {risk_mode}. Use low, medium ou high")
     return mode
 
 
@@ -289,7 +285,7 @@ def load_positions() -> Dict[str, Dict[str, float]]:
 
 
 def log_trade(pair: str, action: str, price: float, pnl: float, reason: str):
-    logger.info(f"TRADE â†’ {pair} {action} price={price} pnl={pnl} reason={reason}")
+    logger.info(f"TRADE -> {pair} {action} price={price} pnl={pnl} reason={reason}")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -318,7 +314,7 @@ def sign(message: str, secret: str) -> str:
 
 def get_headers(method: str, endpoint: str, body: str = "") -> Dict[str, str]:
     if not OKX_API_KEY or not OKX_SECRET_KEY or not OKX_PASSPHRASE:
-        raise RuntimeError("Credenciais da OKX nÃ£o configuradas no ambiente")
+        raise RuntimeError("Credenciais da OKX não configuradas no ambiente")
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     message = timestamp + method + endpoint + body
@@ -362,7 +358,7 @@ def okx_request(method: str, endpoint: str, body: Optional[Dict[str, Any]] = Non
     elif method == "POST":
         response = requests.post(url, headers=headers, data=payload, timeout=20)
     else:
-        raise ValueError(f"MÃ©todo HTTP nÃ£o suportado: {method}")
+        raise ValueError(f"Método HTTP não suportado: {method}")
 
     return response.json()
 
@@ -546,8 +542,8 @@ def place_entry_order(side: str, price: float, pair: str, risk_mode: Optional[st
         return limit_response
 
     if latest_state.get("state") not in {"", None, "canceled", "mmp_canceled"}:
-        logger.error(f"Ordem LIMIT {ord_id} de {pair} ainda estÃ¡ aberta apÃ³s cancelamento: {latest_state}")
-        return {"code": "1", "msg": "ordem limit ainda aberta apÃ³s cancelamento", "data": [latest_state]}
+        logger.error(f"Ordem LIMIT {ord_id} de {pair} ainda está aberta após cancelamento: {latest_state}")
+        return {"code": "1", "msg": "ordem limit ainda aberta após cancelamento", "data": [latest_state]}
 
     logger.info(f"ORDER -> {side.upper()} {pair} type=MARKET fallback=True (risk_mode={mode})")
     market_body = build_order_body(side, price, pair, mode, ord_type="market")
@@ -570,7 +566,8 @@ def place_order(
 
     if not is_exit:
         return place_entry_order(side, price, pair, mode)
-    logger.info(f"ORDER â†’ {side.upper()} {pair} @ {price} (risk_mode={mode})")
+
+    logger.info(f"ORDER -> {side.upper()} {pair} @ {price} (risk_mode={mode})")
 
     if DRY_RUN:
         logger.info(
@@ -592,7 +589,7 @@ def place_order(
 # ====
 # MARKET
 # ====
-def get_candles(pair: str, timeframe: str = "1m", limit: int = 6) -> Tuple[List[float], List[float]]:
+def get_candles(pair: str, timeframe: str = DEFAULT_MARKET_TIMEFRAME, limit: int = 6) -> Tuple[List[float], List[float]]:
     url = f"{OKX_BASE}/api/v5/market/candles?instId={pair}&bar={timeframe}&limit={limit}"
     res = requests.get(url, timeout=20).json()
 
@@ -607,7 +604,7 @@ def get_candles(pair: str, timeframe: str = "1m", limit: int = 6) -> Tuple[List[
 # TREND
 # ====
 def get_trend(pair: str, fast: int, slow: int) -> Dict[str, float]:
-    closes, _ = get_candles(pair, "5m", slow)
+    closes, _ = get_candles(pair, DEFAULT_MARKET_TIMEFRAME, slow)
 
     if len(closes) < slow:
         return {"is_up": False, "gap": 0.0}
@@ -660,8 +657,7 @@ def manage_positions(risk_mode: Optional[str] = None):
             save_position(pair, entry, highest_price)
 
         profit = (current_price - entry) / entry
-        break_even = entry * (1 + TOTAL_TRADE_FEE_RATE)
-        trailing_price = highest_price * SMART_TRAILING_MULTIPLIER
+        take_profit_price = entry * (1 + TAKE_PROFIT_RATE)
 
         if current_price <= entry * (1 - stop_loss):
             order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
@@ -670,18 +666,11 @@ def manage_positions(risk_mode: Optional[str] = None):
                 delete_position(pair)
                 del positions[pair]
 
-        elif (
-            profit >= TRAILING_ACTIVATION_PROFIT
-            and current_price <= trailing_price
-            and current_price > break_even
-        ):
+        elif current_price >= take_profit_price:
             order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
             if order.get("code") == "0":
-                logger.info(
-                    f"SELL_TRAILING -> {pair} profit_pct={profit * 100:.2f} "
-                    f"trailing={trailing_price:.8f} break_even={break_even:.8f} reason=SELL_TRAILING"
-                )
-                log_trade(pair, "SELL", current_price, profit, "SELL_TRAILING")
+                logger.info(f"TAKE_PROFIT -> {pair} profit_pct={profit * 100:.2f} target={take_profit_price:.8f}")
+                log_trade(pair, "SELL", current_price, profit, "take_profit_1_8")
                 delete_position(pair)
                 del positions[pair]
 
@@ -712,7 +701,7 @@ def scan_market(risk_mode: Optional[str] = None):
             continue
 
         candle_limit = max(confirmation_window + 2, 6)
-        closes, volumes = get_candles(pair, "1m", candle_limit)
+        closes, volumes = get_candles(pair, DEFAULT_MARKET_TIMEFRAME, candle_limit)
         if len(closes) < candle_limit or len(volumes) < candle_limit:
             continue
 
@@ -767,7 +756,7 @@ def controlled_loop():
 
 
 # ====
-# MÃ‰TRICAS
+# MÉTRICAS
 # ====
 def get_total_pnl() -> float:
     try:
@@ -940,7 +929,7 @@ def update_bot_risk_mode(
         mode = set_active_risk_mode(risk_mode)
         return api_success(get_risk_mode_payload(), f"Jarvis: modo de risco atualizado para {mode}")
     except ValueError as e:
-        return api_error("Jarvis: risk_mode invÃ¡lido", {"detail": str(e)})
+        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
 
 
 @app.post("/bot/start")
@@ -952,12 +941,12 @@ def start_bot(
     try:
         mode = set_active_risk_mode(risk_mode)
     except ValueError as e:
-        return api_error("Jarvis: risk_mode invÃ¡lido", {"detail": str(e)})
+        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
 
     if bot_running:
         return api_success(
             {"status": "ON", "risk_mode": mode},
-            "Jarvis: bot jÃ¡ estava em execuÃ§Ã£o (modo de risco atualizado)"
+            "Jarvis: bot já estava em execução (modo de risco atualizado)"
         )
 
     bot_running = True
@@ -1052,7 +1041,7 @@ def stats_summary():
         return api_success(stats)
     except Exception as e:
         logger.error(f"stats_summary error: {e}")
-        return api_error("Jarvis: erro ao calcular estatÃ­sticas", {"detail": str(e)})
+        return api_error("Jarvis: erro ao calcular estatísticas", {"detail": str(e)})
 
 
 @app.get("/stats/pnl-history")
@@ -1065,7 +1054,7 @@ def stats_pnl_history(
         return api_success({"interval": interval, "items": history, "count": len(history), "risk_mode": get_active_risk_mode()})
     except Exception as e:
         logger.error(f"stats_pnl_history error: {e}")
-        return api_error("Jarvis: erro ao carregar histÃ³rico de PNL", {"detail": str(e)})
+        return api_error("Jarvis: erro ao carregar histórico de PNL", {"detail": str(e)})
 
 
 @app.on_event("startup")
@@ -1074,3 +1063,4 @@ def startup():
     init_db()
     positions = load_positions()
     logger.info("Jarvis backend inicializado com sucesso")
+
