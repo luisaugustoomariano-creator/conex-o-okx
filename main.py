@@ -55,6 +55,9 @@ PAIRS = [
 
 DRY_RUN = False
 MIN_ORDER_USDT = 20
+ENTRY_LIMIT_OFFSET = 0.001
+ENTRY_LIMIT_TIMEOUT_SECONDS = 10
+ENTRY_LIMIT_POLL_INTERVAL_SECONDS = 1
 
 DEFAULT_RISK_MODE = "medium"
 RISK_MODES = {"low", "medium", "high"}
@@ -279,6 +282,21 @@ def get_balance(asset: str) -> float:
     return 0.0
 
 
+def okx_request(method: str, endpoint: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = json.dumps(body) if body else ""
+    headers = get_headers(method, endpoint, payload)
+    url = OKX_BASE + endpoint
+
+    if method == "GET":
+        response = requests.get(url, headers=headers, timeout=20)
+    elif method == "POST":
+        response = requests.post(url, headers=headers, data=payload, timeout=20)
+    else:
+        raise ValueError(f"Método HTTP não suportado: {method}")
+
+    return response.json()
+
+
 # ====
 # ORDER SIZE
 # ====
@@ -303,19 +321,52 @@ def calculate_order_size(risk_mode: Optional[str] = None) -> float:
 # ====
 # ORDER
 # ====
-def place_order(side: str, price: float, pair: str, risk_mode: Optional[str] = None) -> Dict[str, Any]:
+def calculate_entry_limit_price(side: str, current_price: float) -> float:
+    if side == "buy":
+        return round(current_price * (1 - ENTRY_LIMIT_OFFSET), 8)
+    return round(current_price * (1 + ENTRY_LIMIT_OFFSET), 8)
+
+
+def extract_order_data(order_response: Dict[str, Any]) -> Dict[str, Any]:
+    data = order_response.get("data", [])
+    if data and isinstance(data, list):
+        return data[0]
+    return {}
+
+
+def get_order_state(pair: str, ord_id: str) -> Dict[str, Any]:
+    endpoint = f"/api/v5/trade/order?instId={pair}&ordId={ord_id}"
+    return okx_request("GET", endpoint)
+
+
+def cancel_existing_order(pair: str, ord_id: str) -> Dict[str, Any]:
+    endpoint = "/api/v5/trade/cancel-order"
+    return okx_request("POST", endpoint, {"instId": pair, "ordId": ord_id})
+
+
+def build_order_body(
+    side: str,
+    price: float,
+    pair: str,
+    risk_mode: Optional[str] = None,
+    ord_type: str = "market",
+) -> Dict[str, Any]:
     mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
-    logger.info(f"ORDER → {side.upper()} {pair} @ {price} (risk_mode={mode})")
-
-    if DRY_RUN:
-        return {"code": "0", "msg": "dry_run"}
-
-    endpoint = "/api/v5/trade/order"
-    url = OKX_BASE + endpoint
 
     if side == "buy":
         size = calculate_order_size(mode)
-        body = {
+        if ord_type == "limit":
+            base_size = size / price if price else 0
+            return {
+                "instId": pair,
+                "tdMode": "cash",
+                "side": "buy",
+                "ordType": "limit",
+                "sz": f"{base_size:.6f}",
+                "px": f"{price:.8f}",
+            }
+
+        return {
             "instId": pair,
             "tdMode": "cash",
             "side": "buy",
@@ -323,28 +374,149 @@ def place_order(side: str, price: float, pair: str, risk_mode: Optional[str] = N
             "sz": str(size),
             "tgtCcy": "quote_ccy",
         }
-    else:
-        base_asset = pair.split("-")[0]
-        balance = get_balance(base_asset)
 
-        if balance <= 0:
-            return {"code": "1", "msg": "saldo insuficiente para venda"}
+    base_asset = pair.split("-")[0]
+    balance = get_balance(base_asset)
 
-        size = f"{balance * 0.995:.6f}"
+    if balance <= 0:
+        return {}
 
-        body = {
-            "instId": pair,
-            "tdMode": "cash",
-            "side": "sell",
-            "ordType": "market",
-            "sz": size,
-        }
+    body = {
+        "instId": pair,
+        "tdMode": "cash",
+        "side": "sell",
+        "ordType": ord_type,
+        "sz": f"{balance * 0.995:.6f}",
+    }
 
-    body_str = json.dumps(body)
-    headers = get_headers("POST", endpoint, body_str)
+    if ord_type == "limit":
+        body["px"] = f"{price:.8f}"
 
-    response = requests.post(url, headers=headers, data=body_str, timeout=20)
-    return response.json()
+    return body
+
+
+def submit_order(body: Dict[str, Any]) -> Dict[str, Any]:
+    endpoint = "/api/v5/trade/order"
+    return okx_request("POST", endpoint, body)
+
+
+def wait_for_limit_fill(pair: str, ord_id: str) -> Dict[str, Any]:
+    deadline = time.monotonic() + ENTRY_LIMIT_TIMEOUT_SECONDS
+    latest_state: Dict[str, Any] = {}
+
+    while time.monotonic() < deadline:
+        status_response = get_order_state(pair, ord_id)
+        latest_state = extract_order_data(status_response)
+        state = latest_state.get("state")
+
+        if state == "filled":
+            return latest_state
+
+        if state in {"canceled", "mmp_canceled"}:
+            return latest_state
+
+        time.sleep(ENTRY_LIMIT_POLL_INTERVAL_SECONDS)
+
+    return latest_state
+
+
+def place_entry_order(side: str, price: float, pair: str, risk_mode: Optional[str] = None) -> Dict[str, Any]:
+    mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
+    started_at = time.monotonic()
+    limit_price = calculate_entry_limit_price(side, price)
+    limit_body = build_order_body(side, limit_price, pair, mode, ord_type="limit")
+
+    if not limit_body:
+        return {"code": "1", "msg": "saldo insuficiente para ordem"}
+
+    logger.info(
+        f"ORDER -> {side.upper()} {pair} type=LIMIT trigger_price={price} limit_price={limit_price} "
+        f"fallback=False (risk_mode={mode})"
+    )
+
+    if DRY_RUN:
+        logger.info(
+            f"ORDER RESULT -> {side.upper()} {pair} type=LIMIT fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+        )
+        return {"code": "0", "msg": "dry_run", "data": [{"ordType": "limit"}]}
+
+    limit_response = submit_order(limit_body)
+    limit_data = extract_order_data(limit_response)
+    ord_id = limit_data.get("ordId")
+
+    if limit_response.get("code") != "0" or not ord_id:
+        logger.info(
+            f"ORDER RESULT -> {side.upper()} {pair} type=LIMIT fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+        )
+        return limit_response
+
+    final_state = wait_for_limit_fill(pair, ord_id)
+    if final_state.get("state") == "filled":
+        logger.info(
+            f"ORDER RESULT -> {side.upper()} {pair} type=LIMIT fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+        )
+        return limit_response
+
+    cancel_response = cancel_existing_order(pair, ord_id)
+    if cancel_response.get("code") != "0":
+        latest_state = extract_order_data(get_order_state(pair, ord_id))
+        if latest_state.get("state") == "filled":
+            logger.info(
+                f"ORDER RESULT -> {side.upper()} {pair} type=LIMIT fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+            )
+            return limit_response
+        logger.error(f"Falha ao cancelar ordem LIMIT {ord_id} de {pair}: {cancel_response}")
+        return cancel_response
+
+    latest_state = extract_order_data(get_order_state(pair, ord_id))
+    if latest_state.get("state") == "filled":
+        logger.info(
+            f"ORDER RESULT -> {side.upper()} {pair} type=LIMIT fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+        )
+        return limit_response
+
+    if latest_state.get("state") not in {"", None, "canceled", "mmp_canceled"}:
+        logger.error(f"Ordem LIMIT {ord_id} de {pair} ainda está aberta após cancelamento: {latest_state}")
+        return {"code": "1", "msg": "ordem limit ainda aberta após cancelamento", "data": [latest_state]}
+
+    logger.info(f"ORDER -> {side.upper()} {pair} type=MARKET fallback=True (risk_mode={mode})")
+    market_body = build_order_body(side, price, pair, mode, ord_type="market")
+    market_response = submit_order(market_body)
+    logger.info(
+        f"ORDER RESULT -> {side.upper()} {pair} type=MARKET fallback=True execution_time={time.monotonic() - started_at:.2f}s"
+    )
+    return market_response
+
+
+def place_order(
+    side: str,
+    price: float,
+    pair: str,
+    risk_mode: Optional[str] = None,
+    is_exit: bool = False,
+) -> Dict[str, Any]:
+    mode = normalize_risk_mode(risk_mode) if risk_mode else get_active_risk_mode()
+    started_at = time.monotonic()
+
+    if not is_exit:
+        return place_entry_order(side, price, pair, mode)
+    logger.info(f"ORDER → {side.upper()} {pair} @ {price} (risk_mode={mode})")
+
+    if DRY_RUN:
+        logger.info(
+            f"ORDER RESULT -> {side.upper()} {pair} type=MARKET fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+        )
+        return {"code": "0", "msg": "dry_run", "data": [{"ordType": "market"}]}
+
+    body = build_order_body(side, price, pair, mode, ord_type="market")
+    if not body:
+        return {"code": "1", "msg": "saldo insuficiente para venda"}
+
+    result = submit_order(body)
+    logger.info(
+        f"ORDER RESULT -> {side.upper()} {pair} type=MARKET fallback=False execution_time={time.monotonic() - started_at:.2f}s"
+    )
+    return result
 
 
 # ====
@@ -419,13 +591,13 @@ def manage_positions(risk_mode: Optional[str] = None):
         profit = (current_price - entry) / entry
 
         if current_price <= entry * (1 - stop_loss):
-            order = place_order("sell", current_price, pair, risk_mode)
+            order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, f"stop_loss_{get_active_risk_mode()}")
                 del positions[pair]
 
         elif current_price <= pos["max_price"] * (1 - trailing_stop):
-            order = place_order("sell", current_price, pair, risk_mode)
+            order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, f"trailing_stop_{get_active_risk_mode()}")
                 del positions[pair]
