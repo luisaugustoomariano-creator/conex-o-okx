@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 app = FastAPI(title="Jarvis Cripto Bot API", version="2.1.0")
 
 # ====
-# 🔥 CORS
+# ðŸ”¥ CORS
 # ====
 app.add_middleware(
     CORSMiddleware,
@@ -58,12 +58,15 @@ MIN_ORDER_USDT = 20
 ENTRY_LIMIT_OFFSET = 0.001
 ENTRY_LIMIT_TIMEOUT_SECONDS = 10
 ENTRY_LIMIT_POLL_INTERVAL_SECONDS = 1
+TOTAL_TRADE_FEE_RATE = 0.008
+TRAILING_ACTIVATION_PROFIT = 0.01
+SMART_TRAILING_MULTIPLIER = 0.995
 
 DEFAULT_RISK_MODE = "medium"
 RISK_MODES = {"low", "medium", "high"}
 
 RISK_PROFILES: Dict[str, Dict[str, float]] = {
-    # Mais conservador: menos entradas, maior confirmação, menor risco por posição
+    # Mais conservador: menos entradas, maior confirmaÃ§Ã£o, menor risco por posiÃ§Ã£o
     "low": {
         "risk_per_trade": 0.02,
         "stop_loss": 0.009,
@@ -78,7 +81,7 @@ RISK_PROFILES: Dict[str, Dict[str, float]] = {
         "confirmation_window": 4,
         "required_green_candles": 3,
     },
-    # Estratégia atual (balanceada)
+    # EstratÃ©gia atual (balanceada)
     "medium": {
         "risk_per_trade": 0.04,
         "stop_loss": 0.010,
@@ -122,7 +125,7 @@ state_lock = threading.Lock()
 
 
 # ====
-# HELPERS DE RESPOSTA (PADRÃO JSON)
+# HELPERS DE RESPOSTA (PADRÃƒO JSON)
 # ====
 def api_success(data: Any = None, message: str = "ok") -> Dict[str, Any]:
     return {
@@ -148,7 +151,7 @@ def api_error(message: str, data: Any = None) -> Dict[str, Any]:
 def normalize_risk_mode(risk_mode: Optional[str]) -> str:
     mode = (risk_mode or DEFAULT_RISK_MODE).strip().lower()
     if mode not in RISK_MODES:
-        raise ValueError(f"risk_mode inválido: {risk_mode}. Use low, medium ou high")
+        raise ValueError(f"risk_mode invÃ¡lido: {risk_mode}. Use low, medium ou high")
     return mode
 
 
@@ -213,13 +216,80 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades (pair)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_action ON trades (action)")
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            pair VARCHAR(20) PRIMARY KEY,
+            entry_price NUMERIC NOT NULL,
+            max_price NUMERIC NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     cursor.close()
     conn.close()
 
 
+def save_position(pair: str, entry_price: float, max_price: float):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO positions (pair, entry_price, max_price)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (pair)
+        DO UPDATE SET
+            entry_price = EXCLUDED.entry_price,
+            max_price = EXCLUDED.max_price
+        """,
+        (pair, entry_price, max_price),
+    )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def delete_position(pair: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM positions WHERE pair = %s", (pair,))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def load_positions() -> Dict[str, Dict[str, float]]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT pair, entry_price, max_price
+        FROM positions
+        """
+    )
+
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    loaded_positions: Dict[str, Dict[str, float]] = {}
+    for pair, entry_price, max_price in rows:
+        loaded_positions[pair] = {
+            "entry_price": float(entry_price),
+            "max_price": float(max_price),
+        }
+
+    logger.info(f"POSITIONS LOAD -> {len(loaded_positions)} posicoes carregadas do banco")
+    return loaded_positions
+
+
 def log_trade(pair: str, action: str, price: float, pnl: float, reason: str):
-    logger.info(f"TRADE → {pair} {action} price={price} pnl={pnl} reason={reason}")
+    logger.info(f"TRADE â†’ {pair} {action} price={price} pnl={pnl} reason={reason}")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -248,7 +318,7 @@ def sign(message: str, secret: str) -> str:
 
 def get_headers(method: str, endpoint: str, body: str = "") -> Dict[str, str]:
     if not OKX_API_KEY or not OKX_SECRET_KEY or not OKX_PASSPHRASE:
-        raise RuntimeError("Credenciais da OKX não configuradas no ambiente")
+        raise RuntimeError("Credenciais da OKX nÃ£o configuradas no ambiente")
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
     message = timestamp + method + endpoint + body
@@ -292,7 +362,7 @@ def okx_request(method: str, endpoint: str, body: Optional[Dict[str, Any]] = Non
     elif method == "POST":
         response = requests.post(url, headers=headers, data=payload, timeout=20)
     else:
-        raise ValueError(f"Método HTTP não suportado: {method}")
+        raise ValueError(f"MÃ©todo HTTP nÃ£o suportado: {method}")
 
     return response.json()
 
@@ -476,8 +546,8 @@ def place_entry_order(side: str, price: float, pair: str, risk_mode: Optional[st
         return limit_response
 
     if latest_state.get("state") not in {"", None, "canceled", "mmp_canceled"}:
-        logger.error(f"Ordem LIMIT {ord_id} de {pair} ainda está aberta após cancelamento: {latest_state}")
-        return {"code": "1", "msg": "ordem limit ainda aberta após cancelamento", "data": [latest_state]}
+        logger.error(f"Ordem LIMIT {ord_id} de {pair} ainda estÃ¡ aberta apÃ³s cancelamento: {latest_state}")
+        return {"code": "1", "msg": "ordem limit ainda aberta apÃ³s cancelamento", "data": [latest_state]}
 
     logger.info(f"ORDER -> {side.upper()} {pair} type=MARKET fallback=True (risk_mode={mode})")
     market_body = build_order_body(side, price, pair, mode, ord_type="market")
@@ -500,7 +570,7 @@ def place_order(
 
     if not is_exit:
         return place_entry_order(side, price, pair, mode)
-    logger.info(f"ORDER → {side.upper()} {pair} @ {price} (risk_mode={mode})")
+    logger.info(f"ORDER â†’ {side.upper()} {pair} @ {price} (risk_mode={mode})")
 
     if DRY_RUN:
         logger.info(
@@ -573,7 +643,6 @@ def manage_positions(risk_mode: Optional[str] = None):
 
     profile = get_risk_profile(risk_mode)
     stop_loss = profile["stop_loss"]
-    trailing_stop = profile["trailing_stop"]
 
     for pair in list(positions.keys()):
         closes, _ = get_candles(pair)
@@ -583,23 +652,37 @@ def manage_positions(risk_mode: Optional[str] = None):
         current_price = closes[0]
         pos = positions[pair]
         entry = pos["entry_price"]
-        max_price = pos.get("max_price", entry)
+        highest_price = pos.get("max_price", entry)
 
-        if current_price > max_price:
+        if current_price > highest_price:
             pos["max_price"] = current_price
+            highest_price = current_price
+            save_position(pair, entry, highest_price)
 
         profit = (current_price - entry) / entry
+        break_even = entry * (1 + TOTAL_TRADE_FEE_RATE)
+        trailing_price = highest_price * SMART_TRAILING_MULTIPLIER
 
         if current_price <= entry * (1 - stop_loss):
             order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
             if order.get("code") == "0":
                 log_trade(pair, "SELL", current_price, profit, f"stop_loss_{get_active_risk_mode()}")
+                delete_position(pair)
                 del positions[pair]
 
-        elif current_price <= pos["max_price"] * (1 - trailing_stop):
+        elif (
+            profit >= TRAILING_ACTIVATION_PROFIT
+            and current_price <= trailing_price
+            and current_price > break_even
+        ):
             order = place_order("sell", current_price, pair, risk_mode, is_exit=True)
             if order.get("code") == "0":
-                log_trade(pair, "SELL", current_price, profit, f"trailing_stop_{get_active_risk_mode()}")
+                logger.info(
+                    f"SELL_TRAILING -> {pair} profit_pct={profit * 100:.2f} "
+                    f"trailing={trailing_price:.8f} break_even={break_even:.8f} reason=SELL_TRAILING"
+                )
+                log_trade(pair, "SELL", current_price, profit, "SELL_TRAILING")
+                delete_position(pair)
                 del positions[pair]
 
 
@@ -659,6 +742,7 @@ def scan_market(risk_mode: Optional[str] = None):
                 "entry_price": price,
                 "max_price": price,
             }
+            save_position(pair, price, price)
             log_trade(pair, "BUY", price, 0, f"momentum_{mode}")
 
 
@@ -683,7 +767,7 @@ def controlled_loop():
 
 
 # ====
-# MÉTRICAS
+# MÃ‰TRICAS
 # ====
 def get_total_pnl() -> float:
     try:
@@ -856,7 +940,7 @@ def update_bot_risk_mode(
         mode = set_active_risk_mode(risk_mode)
         return api_success(get_risk_mode_payload(), f"Jarvis: modo de risco atualizado para {mode}")
     except ValueError as e:
-        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
+        return api_error("Jarvis: risk_mode invÃ¡lido", {"detail": str(e)})
 
 
 @app.post("/bot/start")
@@ -868,12 +952,12 @@ def start_bot(
     try:
         mode = set_active_risk_mode(risk_mode)
     except ValueError as e:
-        return api_error("Jarvis: risk_mode inválido", {"detail": str(e)})
+        return api_error("Jarvis: risk_mode invÃ¡lido", {"detail": str(e)})
 
     if bot_running:
         return api_success(
             {"status": "ON", "risk_mode": mode},
-            "Jarvis: bot já estava em execução (modo de risco atualizado)"
+            "Jarvis: bot jÃ¡ estava em execuÃ§Ã£o (modo de risco atualizado)"
         )
 
     bot_running = True
@@ -968,7 +1052,7 @@ def stats_summary():
         return api_success(stats)
     except Exception as e:
         logger.error(f"stats_summary error: {e}")
-        return api_error("Jarvis: erro ao calcular estatísticas", {"detail": str(e)})
+        return api_error("Jarvis: erro ao calcular estatÃ­sticas", {"detail": str(e)})
 
 
 @app.get("/stats/pnl-history")
@@ -981,10 +1065,12 @@ def stats_pnl_history(
         return api_success({"interval": interval, "items": history, "count": len(history), "risk_mode": get_active_risk_mode()})
     except Exception as e:
         logger.error(f"stats_pnl_history error: {e}")
-        return api_error("Jarvis: erro ao carregar histórico de PNL", {"detail": str(e)})
+        return api_error("Jarvis: erro ao carregar histÃ³rico de PNL", {"detail": str(e)})
 
 
 @app.on_event("startup")
 def startup():
+    global positions
     init_db()
+    positions = load_positions()
     logger.info("Jarvis backend inicializado com sucesso")
